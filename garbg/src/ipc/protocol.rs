@@ -4,6 +4,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::ScaleMode;
 
+/// Default max FPS for animations
+fn default_max_fps() -> u32 {
+    60
+}
+
 /// Commands that can be sent to the daemon
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
@@ -21,6 +26,12 @@ pub enum Command {
         /// Shuffle the playlist
         #[serde(default)]
         shuffle: bool,
+        /// Play animated GIFs
+        #[serde(default)]
+        animate: bool,
+        /// Max FPS for animations (default: 60)
+        #[serde(default = "default_max_fps")]
+        max_fps: u32,
     },
 
     /// Set wallpaper for a specific workspace

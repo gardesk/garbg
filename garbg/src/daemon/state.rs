@@ -1,6 +1,6 @@
 //! Daemon state management
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::net::UnixStream;
@@ -8,9 +8,9 @@ use tokio::net::UnixStream;
 use crate::config::{Config, ScaleMode};
 use crate::ipc::{Command, GarEvent, GarIpcClient, IpcServer, Response};
 use crate::ipc::server::IpcClient;
-use crate::media::{scale_image, ImageLoader};
+use crate::media::{scale_image, AnimatedGif, ImageLoader};
 use crate::state::{detect_source_type, PlaylistState};
-use crate::x11::Connection;
+use crate::x11::{AnimationRenderer, Connection};
 
 /// Current wallpaper state for a monitor
 #[derive(Debug, Clone)]
@@ -66,6 +66,48 @@ impl DaemonState {
     }
 }
 
+/// Active animation state
+pub struct ActiveAnimation {
+    /// The animated GIF data
+    gif: AnimatedGif,
+    /// Pre-scaled frames for quick rendering
+    scaled_frames: Vec<image::RgbaImage>,
+    /// Animation renderer (double-buffered)
+    renderer: AnimationRenderer,
+    /// Current frame index
+    current_frame: usize,
+    /// Max FPS
+    max_fps: u32,
+    /// Scale mode
+    scale_mode: ScaleMode,
+    /// Source URI (for status)
+    source: String,
+}
+
+impl ActiveAnimation {
+    /// Get the delay for the current frame
+    fn current_delay(&self) -> Duration {
+        let frame_delay = self.gif.frames()[self.current_frame].delay;
+        let min_delay = if self.max_fps > 0 {
+            Duration::from_secs_f64(1.0 / self.max_fps as f64)
+        } else {
+            Duration::ZERO
+        };
+        frame_delay.max(min_delay)
+    }
+
+    /// Advance to next frame, returning true if looped
+    fn advance(&mut self) -> bool {
+        self.current_frame += 1;
+        if self.current_frame >= self.scaled_frames.len() {
+            self.current_frame = 0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Main daemon struct
 pub struct Daemon {
     /// X11 connection
@@ -73,15 +115,35 @@ pub struct Daemon {
 
     /// Daemon state
     state: DaemonState,
+
+    /// Current animation (if playing)
+    animation: Option<ActiveAnimation>,
 }
 
 impl Daemon {
     /// Create a new daemon
+    ///
+    /// Establishes X11 connection and initializes state.
+    /// Fails early with helpful error messages if X11 is unavailable.
     pub fn new(config: Config) -> Result<Self> {
-        let conn = Connection::new()?;
+        let conn = Connection::new()
+            .context("Failed to initialize X11 connection for daemon")?;
+
+        // Verify connection is working
+        if !conn.is_alive() {
+            anyhow::bail!("X11 connection established but not responding");
+        }
+
+        let (width, height) = conn.screen_dimensions();
+        tracing::info!("X11 connection established (screen: {}x{})", width, height);
+
         let state = DaemonState::new(config);
 
-        Ok(Self { conn, state })
+        Ok(Self {
+            conn,
+            state,
+            animation: None,
+        })
     }
 
     /// Run the daemon event loop
@@ -108,6 +170,9 @@ impl Daemon {
             tracing::info!("Slideshow enabled: {:?} interval", interval);
         }
 
+        // Track next animation frame time
+        let mut next_animation_frame: Option<tokio::time::Instant> = None;
+
         // Main event loop
         loop {
             tokio::select! {
@@ -121,6 +186,12 @@ impl Daemon {
                             // Update slideshow timer if interval changed
                             next_slideshow = self.state.slideshow_interval
                                 .map(|d| tokio::time::Instant::now() + d);
+                            // Update animation timer if animation started
+                            if self.animation.is_some() && next_animation_frame.is_none() {
+                                next_animation_frame = Some(tokio::time::Instant::now());
+                            } else if self.animation.is_none() {
+                                next_animation_frame = None;
+                            }
                         }
                         Err(e) => {
                             tracing::warn!("Accept error: {}", e);
@@ -128,10 +199,33 @@ impl Daemon {
                     }
                 }
 
-                // Slideshow timer (only if enabled and not paused)
+                // Animation frame timer (highest priority when active)
                 _ = async {
-                    match (next_slideshow, self.state.paused) {
-                        (Some(deadline), false) => {
+                    match (next_animation_frame, self.state.paused, &self.animation) {
+                        (Some(deadline), false, Some(_)) => {
+                            tokio::time::sleep_until(deadline).await;
+                        }
+                        _ => {
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                } => {
+                    if let Err(e) = self.render_animation_frame() {
+                        tracing::warn!("Animation frame render failed: {}", e);
+                        // Stop animation on error
+                        self.animation = None;
+                        next_animation_frame = None;
+                    } else if let Some(ref anim) = self.animation {
+                        // Schedule next frame
+                        let delay = anim.current_delay();
+                        next_animation_frame = Some(tokio::time::Instant::now() + delay);
+                    }
+                }
+
+                // Slideshow timer (only if enabled, not paused, and no animation)
+                _ = async {
+                    match (next_slideshow, self.state.paused, &self.animation) {
+                        (Some(deadline), false, None) => {
                             tokio::time::sleep_until(deadline).await;
                         }
                         _ => {
@@ -171,6 +265,21 @@ impl Daemon {
         }
     }
 
+    /// Render the next animation frame
+    fn render_animation_frame(&mut self) -> Result<()> {
+        let anim = self.animation.as_mut()
+            .ok_or_else(|| anyhow::anyhow!("No active animation"))?;
+
+        // Render current frame
+        let frame = &anim.scaled_frames[anim.current_frame];
+        anim.renderer.render_and_present(&mut self.conn, frame)?;
+
+        // Advance to next frame
+        anim.advance();
+
+        Ok(())
+    }
+
     /// Handle a single client connection
     async fn handle_client(&mut self, stream: UnixStream) -> Result<()> {
         let mut client = IpcClient::new(stream);
@@ -187,10 +296,32 @@ impl Daemon {
     /// Handle an IPC command
     fn handle_command(&mut self, cmd: Command) -> Response {
         match cmd {
-            Command::Set { source, mode, monitor: _, interval_secs, shuffle } => {
+            Command::Set { source, mode, monitor: _, interval_secs, shuffle, animate, max_fps } => {
                 let scale_mode = mode.unwrap_or(self.state.config.general.mode);
 
-                // Set up slideshow with the new source
+                // Stop any existing animation first
+                self.animation = None;
+
+                // Check if we should animate (GIF with animate flag)
+                let is_gif = source.to_lowercase().ends_with(".gif")
+                    || source.to_lowercase().contains(".gif?")
+                    || source.to_lowercase().contains("/gif/");
+
+                if animate && is_gif {
+                    // Try to start animation
+                    match self.start_animation(&source, scale_mode, max_fps) {
+                        Ok(_) => {
+                            tracing::info!("Animation started: {}", source);
+                            return Response::ok();
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to start animation: {}, falling back to static", e);
+                            // Fall through to static handling
+                        }
+                    }
+                }
+
+                // Set up slideshow with the new source (static image)
                 match self.set_wallpaper_with_options(&source, scale_mode, shuffle, interval_secs) {
                     Ok(_) => {
                         // Update slideshow interval
@@ -330,6 +461,70 @@ impl Daemon {
         }
 
         self.set_wallpaper_from_source(&source, mode, shuffle)
+    }
+
+    /// Start an animated GIF playback
+    fn start_animation(&mut self, source: &str, mode: ScaleMode, max_fps: u32) -> Result<()> {
+        let is_remote = source.starts_with("http://") || source.starts_with("https://");
+
+        // Load the GIF
+        let gif = if is_remote {
+            tracing::info!("Fetching remote GIF: {}", source);
+            let bytes = self.fetch_bytes(source)?;
+            AnimatedGif::load_from_bytes(&bytes)?
+        } else {
+            let expanded = shellexpand::tilde(source);
+            AnimatedGif::load(expanded.as_ref())?
+        };
+
+        if !gif.is_animated() {
+            anyhow::bail!("GIF is not animated (single frame)");
+        }
+
+        // Pre-scale all frames
+        let (width, height) = self.conn.screen_dimensions();
+        let scaled_frames: Vec<image::RgbaImage> = gif
+            .frames()
+            .iter()
+            .map(|frame| scale_image(&frame.image, width as u32, height as u32, mode))
+            .collect();
+
+        // Create animation renderer
+        let renderer = AnimationRenderer::new(&self.conn)?;
+
+        tracing::info!(
+            "Animation loaded: {} frames, {:.1} FPS",
+            gif.frame_count(),
+            gif.average_fps()
+        );
+
+        self.animation = Some(ActiveAnimation {
+            gif,
+            scaled_frames,
+            renderer,
+            current_frame: 0,
+            max_fps,
+            scale_mode: mode,
+            source: source.to_string(),
+        });
+
+        Ok(())
+    }
+
+    /// Fetch raw bytes from a URL
+    fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>> {
+        let client = reqwest::blocking::Client::builder()
+            .user_agent("garbg/0.1")
+            .build()?;
+
+        let response = client.get(url).send()?;
+        let status = response.status();
+
+        if !status.is_success() {
+            anyhow::bail!("HTTP error {}: {}", status, url);
+        }
+
+        Ok(response.bytes()?.to_vec())
     }
 
     /// Set wallpaper with full options (used by IPC Set command)

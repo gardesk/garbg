@@ -6,6 +6,26 @@ use x11rb::protocol::xproto::*;
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
+/// X11 connection errors with helpful messages
+#[derive(Debug, thiserror::Error)]
+pub enum X11Error {
+    #[error("DISPLAY environment variable not set. Is an X11 server running?")]
+    NoDisplay,
+
+    #[error("Failed to connect to X server at '{display}': {source}. Is the X server running?")]
+    ConnectionFailed {
+        display: String,
+        #[source]
+        source: x11rb::errors::ConnectError,
+    },
+
+    #[error("X11 operation failed: {0}")]
+    Protocol(#[from] x11rb::errors::ConnectionError),
+
+    #[error("X11 reply error: {0}")]
+    Reply(#[from] x11rb::errors::ReplyError),
+}
+
 /// Interned X11 atoms for wallpaper operations
 pub struct Atoms {
     /// Standard atom for root pixmap (used by many apps)
@@ -50,9 +70,26 @@ pub struct Connection {
 
 impl Connection {
     /// Create a new X11 connection
+    ///
+    /// Returns helpful error messages if X11 is not available:
+    /// - Checks for DISPLAY environment variable
+    /// - Provides actionable error messages for common failures
     pub fn new() -> Result<Self> {
-        let (conn, screen_num) = RustConnection::connect(None)
-            .context("Failed to connect to X server")?;
+        // Check DISPLAY environment variable first for a better error message
+        let display = std::env::var("DISPLAY").ok();
+        if display.is_none() {
+            return Err(X11Error::NoDisplay.into());
+        }
+
+        let (conn, screen_num) = match RustConnection::connect(None) {
+            Ok(result) => result,
+            Err(e) => {
+                return Err(X11Error::ConnectionFailed {
+                    display: display.unwrap_or_else(|| "unknown".to_string()),
+                    source: e,
+                }.into());
+            }
+        };
 
         let screen = &conn.setup().roots[screen_num];
         let root = screen.root;
@@ -111,6 +148,16 @@ impl Connection {
     /// Get atoms
     pub fn atoms(&self) -> &Atoms {
         &self.atoms
+    }
+
+    /// Check if the X11 connection is still alive
+    ///
+    /// Performs a round-trip to the X server to verify connectivity.
+    /// Returns false if the connection is broken.
+    pub fn is_alive(&self) -> bool {
+        // GetInputFocus is a cheap round-trip to verify connection health
+        self.conn.get_input_focus().is_ok()
+            && self.conn.sync().is_ok()
     }
 
     /// Set a wallpaper from BGRA image data

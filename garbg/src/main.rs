@@ -43,6 +43,14 @@ enum Commands {
         /// Auto-rotate interval (e.g., "5m", "30s", "1h"). Process stays running.
         #[arg(short, long, value_parser = parse_duration)]
         interval: Option<Duration>,
+
+        /// Play animated GIFs (auto-detected by default)
+        #[arg(short, long)]
+        animate: bool,
+
+        /// Max FPS for animations (default: 60)
+        #[arg(long, default_value = "60")]
+        max_fps: u32,
     },
 
     /// Advance to the next image in the playlist
@@ -96,8 +104,8 @@ fn main() -> Result<()> {
         .init();
 
     match cli.command {
-        Commands::Set { source, mode, monitor, random, interval } => {
-            set_wallpaper(&source, &mode, monitor.as_deref(), random, interval)?;
+        Commands::Set { source, mode, monitor, random, interval, animate, max_fps } => {
+            set_wallpaper(&source, &mode, monitor.as_deref(), random, interval, animate, max_fps)?;
         }
         Commands::Next => {
             cmd_next()?;
@@ -134,6 +142,8 @@ fn set_wallpaper(
     _monitor: Option<&str>,
     random: bool,
     interval: Option<Duration>,
+    animate: bool,
+    max_fps: u32,
 ) -> Result<()> {
     use garbg::config::ScaleMode;
     use garbg::ipc::{is_daemon_running, send_command_blocking, Command};
@@ -143,7 +153,7 @@ fn set_wallpaper(
     // Normalize GitHub URLs first
     let normalized_source = normalize_github_url(source);
 
-    // If daemon is running, delegate to it (especially for interval-based rotation)
+    // If daemon is running, delegate to it
     if is_daemon_running() {
         let interval_secs = interval.map(|d| d.as_secs());
 
@@ -153,6 +163,8 @@ fn set_wallpaper(
             monitor: None,
             interval_secs,
             shuffle: random,
+            animate,
+            max_fps,
         };
 
         let response = send_command_blocking(&cmd)?;
@@ -223,10 +235,11 @@ fn set_wallpaper(
         );
     }
 
-    // Set the initial wallpaper
-    set_single_wallpaper(&resolved_source, scale_mode)?;
+    // Set the initial wallpaper (handles animated GIFs automatically)
+    set_single_wallpaper(&resolved_source, scale_mode, animate, max_fps)?;
 
     // If interval specified and daemon not running, enter foreground rotation loop
+    // Note: --interval mode doesn't support animations (would require stopping animation to rotate)
     if let Some(interval_duration) = interval {
         if let Some(mut playlist_state) = state {
             tracing::info!(
@@ -244,7 +257,8 @@ fn set_wallpaper(
                 let next_img = playlist_state.next().to_string();
                 playlist_state.save()?;
 
-                set_single_wallpaper(&next_img, playlist_state.mode)?;
+                // Static mode for rotation (animation would conflict)
+                set_single_wallpaper(&next_img, playlist_state.mode, false, 60)?;
                 tracing::info!(
                     "Rotated to [{}/{}]: {}",
                     playlist_state.current_index + 1,
@@ -261,12 +275,74 @@ fn set_wallpaper(
 }
 
 /// Set a single wallpaper (used by set, next, prev)
-fn set_single_wallpaper(source: &str, mode: garbg::config::ScaleMode) -> Result<()> {
-    use garbg::media::ImageLoader;
+///
+/// If `animate` is true and the source is an animated GIF, this will block
+/// and play the animation until interrupted (Ctrl+C).
+fn set_single_wallpaper(
+    source: &str,
+    mode: garbg::config::ScaleMode,
+    animate: bool,
+    max_fps: u32,
+) -> Result<()> {
+    use garbg::daemon::{AnimationConfig, AnimationLoop};
+    use garbg::media::{AnimatedGif, ImageLoader};
     use garbg::x11::Connection;
 
     tracing::info!("Setting wallpaper: {}", source);
 
+    // Check if source is a GIF file (by extension or URL path)
+    let is_gif = source.to_lowercase().ends_with(".gif")
+        || source.to_lowercase().contains(".gif?")  // URL with query params
+        || source.to_lowercase().contains("/gif/"); // Giphy-style URLs
+
+    let is_remote = source.starts_with("http://") || source.starts_with("https://");
+
+    // If it's a GIF and animation is requested, try to load as animated
+    if is_gif && animate {
+        // Load GIF data (from file or URL)
+        let gif_result = if is_remote {
+            tracing::info!("Fetching remote GIF...");
+            fetch_gif_from_url(source)
+        } else {
+            AnimatedGif::load(source)
+        };
+
+        match gif_result {
+            Ok(gif) if gif.is_animated() => {
+                // It's an animated GIF - play it
+                let mut conn = Connection::new()?;
+                let config = AnimationConfig {
+                    max_fps,
+                    adaptive_skip: true,
+                    scale_mode: mode,
+                };
+
+                let mut animation = AnimationLoop::new(gif, &conn, config)?;
+
+                tracing::info!(
+                    "Playing animated GIF: {} frames, {:.1} FPS (Ctrl+C to stop)",
+                    animation.info().frame_count,
+                    animation.info().average_fps
+                );
+
+                // Run animation (blocking until Ctrl+C)
+                animation.run(&mut conn)?;
+
+                // Clean up
+                animation.destroy(&conn);
+                return Ok(());
+            }
+            Ok(_) => {
+                // Single-frame GIF, fall through to static handling
+                tracing::debug!("GIF has single frame, treating as static image");
+            }
+            Err(e) => {
+                tracing::debug!("Failed to load as animated GIF: {}, trying as static", e);
+            }
+        }
+    }
+
+    // Static image handling
     let mut conn = Connection::new()?;
 
     let image = if source.starts_with("http://") || source.starts_with("https://") {
@@ -292,7 +368,8 @@ fn cmd_next() -> Result<()> {
     let next_image = state.next().to_string();
     state.save()?;
 
-    set_single_wallpaper(&next_image, state.mode)?;
+    // No animation for quick navigation commands
+    set_single_wallpaper(&next_image, state.mode, false, 60)?;
 
     tracing::info!(
         "Next [{}/{}]: {}",
@@ -312,7 +389,8 @@ fn cmd_prev() -> Result<()> {
     let prev_image = state.prev().to_string();
     state.save()?;
 
-    set_single_wallpaper(&prev_image, state.mode)?;
+    // No animation for quick navigation commands
+    set_single_wallpaper(&prev_image, state.mode, false, 60)?;
 
     tracing::info!(
         "Prev [{}/{}]: {}",
@@ -551,6 +629,25 @@ fn fetch_image_from_url(url: &str) -> Result<image::RgbaImage> {
 
     let bytes = response.bytes()?;
     ImageLoader::load_bytes(&bytes, None)
+}
+
+/// Fetch an animated GIF from a URL
+fn fetch_gif_from_url(url: &str) -> Result<garbg::media::AnimatedGif> {
+    use garbg::media::AnimatedGif;
+
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("garbg/0.1")
+        .build()?;
+
+    let response = client.get(url).send()?;
+    let status = response.status();
+
+    if !status.is_success() {
+        anyhow::bail!("HTTP error {}: {}", status, url);
+    }
+
+    let bytes = response.bytes()?;
+    AnimatedGif::load_from_bytes(&bytes)
 }
 
 /// List images from a source and print them
