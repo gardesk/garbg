@@ -1,1 +1,23 @@
-docs/
+# Build artifacts
+/target/
+**/target/
+
+# Cargo lock for binaries is committed, but generated files are not
+# Cargo.lock
+
+# Editor files
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Local config overrides
+config.local.toml

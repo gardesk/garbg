@@ -1,0 +1,22 @@
+[Unit]
+Description=garbg wallpaper daemon for gar window manager
+Documentation=https://github.com/tenseleyFlow/garbg
+After=graphical-session.target
+
+[Service]
+Type=simple
+
+# Development path (current build)
+ExecStart=/home/mfwolffe/GithubOrgs/tenseleyFlow/garbg/target/release/garbg daemon
+
+# Production path (after install to PATH)
+#ExecStart=garbg daemon
+
+Restart=on-failure
+RestartSec=5
+
+# Environment
+Environment=DISPLAY=:0
+
+[Install]
+WantedBy=default.target
