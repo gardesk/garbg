@@ -4,13 +4,19 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::net::UnixStream;
+use tokio::signal::unix::{signal, SignalKind};
 
+use crate::cache::DiskCache;
 use crate::config::{Config, ScaleMode};
 use crate::ipc::{Command, GarEvent, GarIpcClient, IpcServer, Response};
 use crate::ipc::server::IpcClient;
-use crate::media::{scale_image, AnimatedGif, ImageLoader};
+use crate::media::{scale_image, AnimatedGif, AnimatedPng, AnimatedWebP, AnimationFrame, ImageLoader};
+#[cfg(feature = "video")]
+use crate::media::{VideoDecoder, is_video_file};
 use crate::state::{detect_source_type, PlaylistState};
 use crate::x11::{AnimationRenderer, Connection};
+
+use super::pid;
 
 /// Current wallpaper state for a monitor
 #[derive(Debug, Clone)]
@@ -66,28 +72,61 @@ impl DaemonState {
     }
 }
 
-/// Active animation state
+/// Active animation state (works with GIF, WebP, or other animated formats)
 pub struct ActiveAnimation {
-    /// The animated GIF data
-    gif: AnimatedGif,
     /// Pre-scaled frames for quick rendering
     scaled_frames: Vec<image::RgbaImage>,
+    /// Frame delays (parallel to scaled_frames)
+    frame_delays: Vec<Duration>,
     /// Animation renderer (double-buffered)
     renderer: AnimationRenderer,
     /// Current frame index
     current_frame: usize,
     /// Max FPS
     max_fps: u32,
-    /// Scale mode
+    /// Scale mode (for status)
+    #[allow(dead_code)]
     scale_mode: ScaleMode,
     /// Source URI (for status)
+    #[allow(dead_code)]
     source: String,
 }
 
 impl ActiveAnimation {
+    /// Create from animation frames
+    fn from_frames(
+        frames: &[AnimationFrame],
+        renderer: AnimationRenderer,
+        max_fps: u32,
+        scale_mode: ScaleMode,
+        source: String,
+        screen_width: u32,
+        screen_height: u32,
+    ) -> Self {
+        let scaled_frames: Vec<image::RgbaImage> = frames
+            .iter()
+            .map(|frame| scale_image(&frame.image, screen_width, screen_height, scale_mode))
+            .collect();
+
+        let frame_delays: Vec<Duration> = frames
+            .iter()
+            .map(|frame| frame.delay)
+            .collect();
+
+        Self {
+            scaled_frames,
+            frame_delays,
+            renderer,
+            current_frame: 0,
+            max_fps,
+            scale_mode,
+            source,
+        }
+    }
+
     /// Get the delay for the current frame
     fn current_delay(&self) -> Duration {
-        let frame_delay = self.gif.frames()[self.current_frame].delay;
+        let frame_delay = self.frame_delays[self.current_frame];
         let min_delay = if self.max_fps > 0 {
             Duration::from_secs_f64(1.0 / self.max_fps as f64)
         } else {
@@ -106,6 +145,12 @@ impl ActiveAnimation {
             false
         }
     }
+
+    /// Get frame count
+    #[allow(dead_code)]
+    fn frame_count(&self) -> usize {
+        self.scaled_frames.len()
+    }
 }
 
 /// Main daemon struct
@@ -118,6 +163,9 @@ pub struct Daemon {
 
     /// Current animation (if playing)
     animation: Option<ActiveAnimation>,
+
+    /// Disk cache for remote images
+    cache: Option<DiskCache>,
 }
 
 impl Daemon {
@@ -137,17 +185,50 @@ impl Daemon {
         let (width, height) = conn.screen_dimensions();
         tracing::info!("X11 connection established (screen: {}x{})", width, height);
 
+        // Initialize disk cache
+        let cache = match DiskCache::default_dir() {
+            Some(cache_dir) => {
+                let max_size_mb = config.cache.max_size_mb;
+                match DiskCache::new(cache_dir.clone(), max_size_mb) {
+                    Ok(cache) => {
+                        tracing::info!("Disk cache initialized: {} (max {}MB)", cache_dir.display(), max_size_mb);
+                        Some(cache)
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to initialize disk cache: {}", e);
+                        None
+                    }
+                }
+            }
+            None => {
+                tracing::warn!("No cache directory available, caching disabled");
+                None
+            }
+        };
+
         let state = DaemonState::new(config);
 
         Ok(Self {
             conn,
             state,
             animation: None,
+            cache,
         })
     }
 
     /// Run the daemon event loop
     pub async fn run(&mut self) -> Result<()> {
+        // Check for stale PID file and clean up
+        if let Some(existing_pid) = pid::check_stale_pid()? {
+            anyhow::bail!("Another daemon is already running (PID: {})", existing_pid);
+        }
+
+        // Write our PID file
+        pid::write_pid_file()?;
+
+        // Ensure cleanup on exit (both normal and panic)
+        let _pid_guard = PidFileGuard;
+
         let server = IpcServer::new().await?;
         tracing::info!("Listening on {}", server.path().display());
 
@@ -173,9 +254,34 @@ impl Daemon {
         // Track next animation frame time
         let mut next_animation_frame: Option<tokio::time::Instant> = None;
 
+        // Set up signal handlers
+        let mut sigterm = signal(SignalKind::terminate())?;
+        let mut sigint = signal(SignalKind::interrupt())?;
+        let mut sighup = signal(SignalKind::hangup())?;
+
         // Main event loop
         loop {
             tokio::select! {
+                // SIGTERM - graceful shutdown
+                _ = sigterm.recv() => {
+                    tracing::info!("Received SIGTERM, shutting down...");
+                    break;
+                }
+
+                // SIGINT (Ctrl+C) - graceful shutdown
+                _ = sigint.recv() => {
+                    tracing::info!("Received SIGINT, shutting down...");
+                    break;
+                }
+
+                // SIGHUP - reload configuration
+                _ = sighup.recv() => {
+                    tracing::info!("Received SIGHUP, reloading configuration...");
+                    if let Err(e) = self.reload_config() {
+                        tracing::error!("Failed to reload config: {}", e);
+                    }
+                }
+
                 // IPC client connection
                 result = server.accept() => {
                     match result {
@@ -263,6 +369,11 @@ impl Daemon {
                 }
             }
         }
+
+        // Graceful shutdown complete
+        // PID file will be removed by PidFileGuard drop
+        tracing::info!("Daemon shutdown complete");
+        Ok(())
     }
 
     /// Render the next animation frame
@@ -302,12 +413,37 @@ impl Daemon {
                 // Stop any existing animation first
                 self.animation = None;
 
-                // Check if we should animate (GIF with animate flag)
-                let is_gif = source.to_lowercase().ends_with(".gif")
-                    || source.to_lowercase().contains(".gif?")
-                    || source.to_lowercase().contains("/gif/");
+                // Check if we should animate (GIF, WebP, or APNG with animate flag)
+                let source_lower = source.to_lowercase();
+                let is_animatable = source_lower.ends_with(".gif")
+                    || source_lower.contains(".gif?")
+                    || source_lower.contains("/gif/")
+                    || source_lower.ends_with(".webp")
+                    || source_lower.contains(".webp?")
+                    || source_lower.contains("/webp/")
+                    || source_lower.ends_with(".apng")
+                    || source_lower.ends_with(".png")  // PNG might be APNG
+                    || source_lower.contains(".apng?")
+                    // Video formats
+                    || source_lower.ends_with(".mp4")
+                    || source_lower.ends_with(".webm")
+                    || source_lower.ends_with(".mkv")
+                    || source_lower.ends_with(".avi")
+                    || source_lower.ends_with(".mov")
+                    || source_lower.ends_with(".m4v");
 
-                if animate && is_gif {
+                // Videos should always be animated (no sense displaying a single frame)
+                let is_video = source_lower.ends_with(".mp4")
+                    || source_lower.ends_with(".webm")
+                    || source_lower.ends_with(".mkv")
+                    || source_lower.ends_with(".avi")
+                    || source_lower.ends_with(".mov")
+                    || source_lower.ends_with(".m4v");
+
+                // Auto-animate videos, or animate if flag is set for other formats
+                let should_animate = is_video || (animate && is_animatable);
+
+                if should_animate {
                     // Try to start animation
                     match self.start_animation(&source, scale_mode, max_fps) {
                         Ok(_) => {
@@ -391,8 +527,17 @@ impl Daemon {
                 }
             }
             Command::ClearCache => {
-                // TODO: Implement cache clearing
-                Response::ok()
+                if let Some(ref mut cache) = self.cache {
+                    match cache.clear() {
+                        Ok(_) => {
+                            tracing::info!("Cache cleared");
+                            Response::ok()
+                        }
+                        Err(e) => Response::error(format!("Failed to clear cache: {}", e)),
+                    }
+                } else {
+                    Response::ok() // No cache to clear
+                }
             }
             Command::List { source } => {
                 match self.list_source(&source) {
@@ -463,56 +608,194 @@ impl Daemon {
         self.set_wallpaper_from_source(&source, mode, shuffle)
     }
 
-    /// Start an animated GIF playback
+    /// Start an animated image playback (GIF, WebP, APNG, or video)
     fn start_animation(&mut self, source: &str, mode: ScaleMode, max_fps: u32) -> Result<()> {
         let is_remote = source.starts_with("http://") || source.starts_with("https://");
+        let source_lower = source.to_lowercase();
 
-        // Load the GIF
-        let gif = if is_remote {
-            tracing::info!("Fetching remote GIF: {}", source);
-            let bytes = self.fetch_bytes(source)?;
-            AnimatedGif::load_from_bytes(&bytes)?
-        } else {
+        // Detect format from extension/URL
+        let is_webp = source_lower.ends_with(".webp")
+            || source_lower.contains(".webp?")
+            || source_lower.contains("/webp/");
+        let is_apng = source_lower.ends_with(".apng")
+            || source_lower.contains(".apng?");
+        let is_png = source_lower.ends_with(".png");
+
+        // Check for video formats
+        #[cfg(feature = "video")]
+        let is_video = {
             let expanded = shellexpand::tilde(source);
-            AnimatedGif::load(expanded.as_ref())?
+            !is_remote && is_video_file(expanded.as_ref())
         };
+        #[cfg(not(feature = "video"))]
+        let is_video = false;
 
-        if !gif.is_animated() {
-            anyhow::bail!("GIF is not animated (single frame)");
+        // Handle video separately (can't load into memory efficiently)
+        #[cfg(feature = "video")]
+        if is_video {
+            return self.start_video_animation(source, mode, max_fps);
         }
 
-        // Pre-scale all frames
-        let (width, height) = self.conn.screen_dimensions();
-        let scaled_frames: Vec<image::RgbaImage> = gif
-            .frames()
-            .iter()
-            .map(|frame| scale_image(&frame.image, width as u32, height as u32, mode))
-            .collect();
+        // Load animation data for image formats
+        let bytes = if is_remote {
+            tracing::info!("Fetching remote animation: {}", source);
+            self.fetch_bytes(source)?
+        } else {
+            let expanded = shellexpand::tilde(source);
+            std::fs::read(expanded.as_ref())
+                .with_context(|| format!("Failed to read: {}", source))?
+        };
+
+        // Load frames based on format - clone frames to avoid lifetime issues
+        let (frames, frame_count, avg_fps, format_name): (Vec<AnimationFrame>, usize, f64, &str) = if is_webp {
+            let webp = AnimatedWebP::load_from_bytes(&bytes)?;
+            if !webp.is_animated() {
+                anyhow::bail!("WebP is not animated (single frame)");
+            }
+            let fc = webp.frame_count();
+            let fps = webp.average_fps();
+            (webp.frames().to_vec(), fc, fps, "WebP")
+        } else if is_apng || is_png {
+            // Try APNG first for .png files (might be animated)
+            match AnimatedPng::load_from_bytes(&bytes) {
+                Ok(apng) if apng.is_animated() => {
+                    let fc = apng.frame_count();
+                    let fps = apng.average_fps();
+                    (apng.frames().to_vec(), fc, fps, "APNG")
+                }
+                Ok(_) => {
+                    anyhow::bail!("PNG is not animated");
+                }
+                Err(e) if is_apng => {
+                    // .apng extension but failed to load as APNG
+                    anyhow::bail!("Failed to load APNG: {}", e);
+                }
+                Err(_) => {
+                    // .png extension but not an APNG, try as static
+                    anyhow::bail!("PNG is not animated (use without --animate)");
+                }
+            }
+        } else {
+            // Default to GIF
+            let gif = AnimatedGif::load_from_bytes(&bytes)?;
+            if !gif.is_animated() {
+                anyhow::bail!("GIF is not animated (single frame)");
+            }
+            let fc = gif.frame_count();
+            let fps = gif.average_fps();
+            (gif.frames().to_vec(), fc, fps, "GIF")
+        };
+
+        // Suppress warning when video feature is disabled
+        let _ = is_video;
 
         // Create animation renderer
         let renderer = AnimationRenderer::new(&self.conn)?;
+        let (width, height) = self.conn.screen_dimensions();
 
         tracing::info!(
-            "Animation loaded: {} frames, {:.1} FPS",
-            gif.frame_count(),
-            gif.average_fps()
+            "Animation loaded: {} frames, {:.1} FPS ({})",
+            frame_count,
+            avg_fps,
+            format_name
         );
 
-        self.animation = Some(ActiveAnimation {
-            gif,
-            scaled_frames,
+        self.animation = Some(ActiveAnimation::from_frames(
+            &frames,
             renderer,
-            current_frame: 0,
             max_fps,
-            scale_mode: mode,
-            source: source.to_string(),
-        });
+            mode,
+            source.to_string(),
+            width as u32,
+            height as u32,
+        ));
 
         Ok(())
     }
 
-    /// Fetch raw bytes from a URL
-    fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>> {
+    /// Start video animation playback
+    #[cfg(feature = "video")]
+    fn start_video_animation(&mut self, source: &str, mode: ScaleMode, max_fps: u32) -> Result<()> {
+        let expanded = shellexpand::tilde(source);
+        let path = std::path::Path::new(expanded.as_ref());
+
+        tracing::info!("Opening video: {}", path.display());
+
+        let mut decoder = VideoDecoder::open(path)?;
+        let info = decoder.info().clone();
+        let frame_delay = decoder.frame_delay();
+
+        tracing::info!(
+            "Video: {}x{}, {:.1} FPS, {:.1}s duration, ~{} frames ({})",
+            info.width,
+            info.height,
+            info.frame_rate,
+            info.duration,
+            info.frame_count,
+            info.codec
+        );
+
+        // Limit frames for memory efficiency (max ~30 seconds at target fps)
+        let max_frames = (30.0 * info.frame_rate.min(max_fps as f64)) as usize;
+        let frame_limit = max_frames.max(100).min(info.frame_count);
+
+        // Extract frames
+        let mut frames = Vec::with_capacity(frame_limit);
+        while let Some(decoded) = decoder.next_frame()? {
+            frames.push(AnimationFrame {
+                image: decoded.image,
+                delay: frame_delay,
+            });
+
+            if frames.len() >= frame_limit {
+                tracing::debug!("Reached frame limit ({}), stopping decode", frame_limit);
+                break;
+            }
+        }
+
+        if frames.is_empty() {
+            anyhow::bail!("Video has no decodable frames");
+        }
+
+        let frame_count = frames.len();
+        let avg_fps = info.frame_rate;
+
+        // Create animation renderer
+        let renderer = AnimationRenderer::new(&self.conn)?;
+        let (width, height) = self.conn.screen_dimensions();
+
+        tracing::info!(
+            "Video loaded: {} frames, {:.1} FPS",
+            frame_count,
+            avg_fps
+        );
+
+        self.animation = Some(ActiveAnimation::from_frames(
+            &frames,
+            renderer,
+            max_fps,
+            mode,
+            source.to_string(),
+            width as u32,
+            height as u32,
+        ));
+
+        Ok(())
+    }
+
+    /// Fetch raw bytes from a URL (with caching)
+    fn fetch_bytes(&mut self, url: &str) -> Result<Vec<u8>> {
+        // Check cache first
+        if let Some(ref mut cache) = self.cache {
+            if let Some(cached_path) = cache.get(url) {
+                tracing::debug!("Cache hit: {}", url);
+                return std::fs::read(&cached_path)
+                    .context("Failed to read cached file");
+            }
+        }
+
+        // Fetch from network
+        tracing::debug!("Cache miss, fetching: {}", url);
         let client = reqwest::blocking::Client::builder()
             .user_agent("garbg/0.1")
             .build()?;
@@ -524,7 +807,24 @@ impl Daemon {
             anyhow::bail!("HTTP error {}: {}", status, url);
         }
 
-        Ok(response.bytes()?.to_vec())
+        // Get ETag for conditional requests
+        let etag = response.headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+
+        let bytes = response.bytes()?.to_vec();
+
+        // Store in cache
+        if let Some(ref mut cache) = self.cache {
+            if let Err(e) = cache.store(url, &bytes, etag) {
+                tracing::warn!("Failed to cache {}: {}", url, e);
+            } else {
+                tracing::debug!("Cached: {}", url);
+            }
+        }
+
+        Ok(bytes)
     }
 
     /// Set wallpaper with full options (used by IPC Set command)
@@ -603,20 +903,10 @@ impl Daemon {
         Ok(())
     }
 
-    /// Fetch image from URL
-    fn fetch_image(&self, url: &str) -> Result<image::RgbaImage> {
-        let client = reqwest::blocking::Client::builder()
-            .user_agent("garbg/0.1")
-            .build()?;
-
-        let response = client.get(url).send()?;
-        let status = response.status();
-
-        if !status.is_success() {
-            anyhow::bail!("HTTP error {}: {}", status, url);
-        }
-
-        let bytes = response.bytes()?;
+    /// Fetch image from URL (with caching)
+    fn fetch_image(&mut self, url: &str) -> Result<image::RgbaImage> {
+        // Use cached bytes
+        let bytes = self.fetch_bytes(url)?;
         ImageLoader::load_bytes(&bytes, None)
     }
 
@@ -797,5 +1087,20 @@ impl Daemon {
 
         images.sort();
         Ok(images)
+    }
+}
+
+/// RAII guard for PID file cleanup
+///
+/// Removes the PID file when dropped, ensuring cleanup even on panic.
+struct PidFileGuard;
+
+impl Drop for PidFileGuard {
+    fn drop(&mut self) {
+        if let Err(e) = pid::remove_pid_file() {
+            tracing::warn!("Failed to remove PID file on shutdown: {}", e);
+        } else {
+            tracing::debug!("PID file removed on shutdown");
+        }
     }
 }

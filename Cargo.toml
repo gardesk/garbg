@@ -68,3 +68,13 @@ url = "2"
 
 # Random selection
 rand = "0.8"
+
+# Progress indicators
+indicatif = "0.17"
+
+# S3 support (optional)
+aws-config = "1"
+aws-sdk-s3 = "1"
+
+# Video support (optional)
+ffmpeg-next = "7"

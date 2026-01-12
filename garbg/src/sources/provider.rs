@@ -101,10 +101,50 @@ impl Default for ProviderRegistry {
     fn default() -> Self {
         let mut registry = Self::new();
 
-        // Register default providers
+        // Register default providers in order of preference
+        // GitHub must come before HTTP to handle github:// URIs
+        registry.register(Box::new(super::GitHubProvider::new()));
+        registry.register(Box::new(super::HttpProvider::new()));
         registry.register(Box::new(super::FileProvider::new()));
-        // HTTP and other providers will be registered when needed
 
         registry
+    }
+}
+
+impl ProviderRegistry {
+    /// List wallpapers from a URI using the appropriate provider
+    pub async fn list(&self, uri: &str) -> Result<Vec<WallpaperEntry>> {
+        let provider = self.find_provider(uri)
+            .ok_or_else(|| anyhow::anyhow!("No provider found for URI: {}", uri))?;
+
+        provider.list(uri).await
+    }
+
+    /// Fetch a wallpaper entry using the appropriate provider
+    pub async fn fetch(&self, entry: &WallpaperEntry) -> Result<FetchedImage> {
+        let provider = self.find_provider(&entry.uri)
+            .ok_or_else(|| anyhow::anyhow!("No provider found for URI: {}", entry.uri))?;
+
+        provider.fetch(entry).await
+    }
+
+    /// Fetch raw bytes from a URI (for cache-aware fetching)
+    pub async fn fetch_bytes(&self, uri: &str) -> Result<Vec<u8>> {
+        let provider = self.find_provider(uri)
+            .ok_or_else(|| anyhow::anyhow!("No provider found for URI: {}", uri))?;
+
+        // List to get entry info
+        let entries = provider.list(uri).await?;
+        let entry = entries.first()
+            .ok_or_else(|| anyhow::anyhow!("No wallpapers found at: {}", uri))?;
+
+        // Fetch the image
+        let fetched = provider.fetch(entry).await?;
+
+        // For now, encode back to PNG bytes - TODO: return raw bytes from provider
+        let mut bytes = Vec::new();
+        let mut cursor = std::io::Cursor::new(&mut bytes);
+        fetched.image.write_to(&mut cursor, image::ImageFormat::Png)?;
+        Ok(bytes)
     }
 }

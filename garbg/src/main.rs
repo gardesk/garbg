@@ -2,10 +2,12 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use indicatif::{ProgressBar, ProgressStyle};
 use rand::seq::SliceRandom;
 use std::time::Duration;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
+use garbg::ipc::{Command, Response};
 use garbg::state::{detect_source_type, PlaylistState};
 
 #[derive(Parser)]
@@ -136,6 +138,26 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Send a command to the daemon with a spinner
+fn send_with_spinner(cmd: &Command, message: &str) -> Result<Response> {
+    use garbg::ipc::send_command_blocking;
+
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::default_spinner()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
+            .template("{spinner:.cyan} {msg}")
+            .unwrap()
+    );
+    spinner.set_message(message.to_string());
+    spinner.enable_steady_tick(Duration::from_millis(80));
+
+    let response = send_command_blocking(cmd)?;
+
+    spinner.finish_and_clear();
+    Ok(response)
+}
+
 fn set_wallpaper(
     source: &str,
     mode: &str,
@@ -146,7 +168,7 @@ fn set_wallpaper(
     max_fps: u32,
 ) -> Result<()> {
     use garbg::config::ScaleMode;
-    use garbg::ipc::{is_daemon_running, send_command_blocking, Command};
+    use garbg::ipc::is_daemon_running;
 
     let scale_mode: ScaleMode = mode.parse()?;
 
@@ -167,7 +189,7 @@ fn set_wallpaper(
             max_fps,
         };
 
-        let response = send_command_blocking(&cmd)?;
+        let response = send_with_spinner(&cmd, "Loading wallpaper...")?;
 
         if response.success {
             if let Some(secs) = interval_secs {
@@ -290,12 +312,33 @@ fn set_single_wallpaper(
 
     tracing::info!("Setting wallpaper: {}", source);
 
-    // Check if source is a GIF file (by extension or URL path)
-    let is_gif = source.to_lowercase().ends_with(".gif")
-        || source.to_lowercase().contains(".gif?")  // URL with query params
-        || source.to_lowercase().contains("/gif/"); // Giphy-style URLs
+    // Check if source is animatable (GIF, WebP, or APNG)
+    let source_lower = source.to_lowercase();
+    let is_gif = source_lower.ends_with(".gif")
+        || source_lower.contains(".gif?")  // URL with query params
+        || source_lower.contains("/gif/"); // Giphy-style URLs
+    let is_webp = source_lower.ends_with(".webp")
+        || source_lower.contains(".webp?")
+        || source_lower.contains("/webp/");
+    let is_apng = source_lower.ends_with(".apng")
+        || source_lower.contains(".apng?")
+        || source_lower.ends_with(".png");  // PNG might be APNG
 
     let is_remote = source.starts_with("http://") || source.starts_with("https://");
+
+    // For animated WebP/APNG, recommend using daemon (GIF works standalone)
+    if (is_webp || is_apng) && animate {
+        // WebP/APNG animation is only supported via daemon
+        use garbg::ipc::is_daemon_running;
+        if !is_daemon_running() {
+            let format = if is_webp { "WebP" } else { "APNG" };
+            eprintln!("Note: Animated {} requires daemon mode.", format);
+            eprintln!("      Start daemon first: garbg daemon -d");
+            eprintln!("      Then run: garbg set {} --animate", source);
+            anyhow::bail!("Animated {} requires daemon mode", format);
+        }
+        // Daemon is running - delegate (already done in set_wallpaper)
+    }
 
     // If it's a GIF and animation is requested, try to load as animated
     if is_gif && animate {

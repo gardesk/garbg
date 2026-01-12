@@ -6,7 +6,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::mpsc;
 
 use super::protocol::{Command, Event, Response};
 

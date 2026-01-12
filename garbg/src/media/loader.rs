@@ -1,7 +1,7 @@
 //! Image loading and format detection
 
 use anyhow::{Context, Result};
-use image::{DynamicImage, ImageFormat, RgbaImage};
+use image::{ImageFormat, RgbaImage};
 use std::fs;
 use std::path::Path;
 

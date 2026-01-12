@@ -38,10 +38,23 @@ dirs.workspace = true
 shellexpand.workspace = true
 url.workspace = true
 rand.workspace = true
+indicatif.workspace = true
 
 [features]
-default = []
-# Video support via ffmpeg (optional, requires system ffmpeg)
-video = []
-# S3/object storage support
-s3 = []
+default = ["video"]
+# Video support via ffmpeg (requires system ffmpeg-dev libraries)
+video = ["dep:ffmpeg-next"]
+# S3/object storage support (optional, for cloud storage)
+s3 = ["dep:aws-config", "dep:aws-sdk-s3"]
+
+[dependencies.aws-config]
+version = "1"
+optional = true
+
+[dependencies.aws-sdk-s3]
+version = "1"
+optional = true
+
+[dependencies.ffmpeg-next]
+version = "7"
+optional = true
