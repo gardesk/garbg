@@ -319,6 +319,7 @@ fn set_single_wallpaper(
 
                 let mut animation = AnimationLoop::new(gif, &conn, config)?;
 
+                eprintln!("Tip: For background animation, start daemon first: garbg daemon -d");
                 tracing::info!(
                     "Playing animated GIF: {} frames, {:.1} FPS (Ctrl+C to stop)",
                     animation.info().frame_count,
