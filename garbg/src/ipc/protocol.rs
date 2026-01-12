@@ -86,6 +86,22 @@ pub enum Command {
 
     /// Unsubscribe from events
     Unsubscribe { events: Vec<String> },
+
+    /// Query connected monitors
+    QueryMonitors,
+
+    /// Query current wallpaper info
+    QueryCurrent,
+
+    /// Set wallpaper for a specific monitor
+    SetMonitor {
+        /// Monitor name (e.g., "DP-1", "HDMI-1")
+        monitor: String,
+        /// Wallpaper source
+        source: String,
+        #[serde(default)]
+        mode: Option<ScaleMode>,
+    },
 }
 
 /// Response to a command

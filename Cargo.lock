@@ -1346,6 +1346,7 @@ dependencies = [
  "rand 0.8.5",
  "reqwest",
  "scraper",
+ "sd-notify",
  "serde",
  "serde_json",
  "shellexpand",
@@ -2849,6 +2850,15 @@ checksum = "da046153aa2352493d6cb7da4b6e5c0c057d8a1d0a9aa8560baffdd945acd414"
 dependencies = [
  "ring",
  "untrusted",
+]
+
+[[package]]
+name = "sd-notify"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b943eadf71d8b69e661330cb0e2656e31040acf21ee7708e2c238a0ec6af2bf4"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

@@ -39,6 +39,7 @@ shellexpand.workspace = true
 url.workspace = true
 rand.workspace = true
 indicatif.workspace = true
+sd-notify = "0.4"
 
 [features]
 default = ["video"]

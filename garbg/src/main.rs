@@ -83,6 +83,42 @@ enum Commands {
 
     /// Get current status
     Status,
+
+    /// Pause animations and slideshow
+    Pause,
+
+    /// Resume animations and slideshow
+    Resume,
+
+    /// Toggle pause state
+    Toggle,
+
+    /// Query daemon information
+    Query {
+        #[command(subcommand)]
+        what: QueryCommand,
+    },
+
+    /// Set wallpaper for a specific monitor
+    SetMonitor {
+        /// Monitor name (e.g., "DP-1", "HDMI-1")
+        monitor: String,
+
+        /// Wallpaper source
+        source: String,
+
+        /// Scaling mode (fill, fit, stretch, center, tile)
+        #[arg(short, long, default_value = "fill")]
+        mode: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum QueryCommand {
+    /// List connected monitors (JSON)
+    Monitors,
+    /// Current wallpaper info (JSON)
+    Current,
 }
 
 /// Parse a duration string like "5m", "30s", "1h"
@@ -133,6 +169,24 @@ fn main() -> Result<()> {
         Commands::Status => {
             print_status()?;
         }
+        Commands::Pause => {
+            cmd_pause()?;
+        }
+        Commands::Resume => {
+            cmd_resume()?;
+        }
+        Commands::Toggle => {
+            cmd_toggle()?;
+        }
+        Commands::Query { what } => {
+            match what {
+                QueryCommand::Monitors => cmd_query_monitors()?,
+                QueryCommand::Current => cmd_query_current()?,
+            }
+        }
+        Commands::SetMonitor { monitor, source, mode } => {
+            cmd_set_monitor(&monitor, &source, &mode)?;
+        }
     }
 
     Ok(())
@@ -168,39 +222,43 @@ fn set_wallpaper(
     max_fps: u32,
 ) -> Result<()> {
     use garbg::config::ScaleMode;
-    use garbg::ipc::is_daemon_running;
+    use garbg::ipc::send_command_blocking;
 
     let scale_mode: ScaleMode = mode.parse()?;
 
     // Normalize GitHub URLs first
     let normalized_source = normalize_github_url(source);
 
-    // If daemon is running, delegate to it
-    if is_daemon_running() {
-        let interval_secs = interval.map(|d| d.as_secs());
+    // Try to delegate to daemon
+    let interval_secs = interval.map(|d| d.as_secs());
 
-        let cmd = Command::Set {
-            source: normalized_source.clone(),
-            mode: Some(scale_mode),
-            monitor: None,
-            interval_secs,
-            shuffle: random,
-            animate,
-            max_fps,
-        };
+    let cmd = Command::Set {
+        source: normalized_source.clone(),
+        mode: Some(scale_mode),
+        monitor: None,
+        interval_secs,
+        shuffle: random,
+        animate,
+        max_fps,
+    };
 
-        let response = send_with_spinner(&cmd, "Loading wallpaper...")?;
-
-        if response.success {
-            if let Some(secs) = interval_secs {
-                println!("Slideshow scheduled: {} (every {}s, shuffle: {})",
-                    normalized_source, secs, random);
-            } else {
-                println!("Wallpaper set via daemon: {}", normalized_source);
+    // Try to send to daemon (should be ready if systemd started it correctly)
+    match send_command_blocking(&cmd) {
+        Ok(response) => {
+            if response.success {
+                if let Some(secs) = interval_secs {
+                    println!("Slideshow scheduled: {} (every {}s, shuffle: {})",
+                        normalized_source, secs, random);
+                } else {
+                    println!("Wallpaper set via daemon: {}", normalized_source);
+                }
+                return Ok(());
+            } else if let Some(err) = response.error {
+                anyhow::bail!("Daemon error: {}", err);
             }
-            return Ok(());
-        } else if let Some(err) = response.error {
-            anyhow::bail!("Daemon error: {}", err);
+        }
+        Err(_) => {
+            // Daemon not available - fall through to standalone
         }
     }
 
@@ -809,6 +867,119 @@ fn print_status() -> Result<()> {
             println!("No active playlist.");
             println!("Use 'garbg set <directory>' to create one.");
         }
+    }
+    Ok(())
+}
+
+fn cmd_pause() -> Result<()> {
+    use garbg::ipc::{is_daemon_running, send_command_blocking};
+
+    if !is_daemon_running() {
+        anyhow::bail!("Daemon not running. Start with: garbg daemon");
+    }
+
+    let response = send_command_blocking(&Command::Pause)?;
+    if response.success {
+        println!("Paused");
+    } else if let Some(err) = response.error {
+        anyhow::bail!("Failed to pause: {}", err);
+    }
+    Ok(())
+}
+
+fn cmd_resume() -> Result<()> {
+    use garbg::ipc::{is_daemon_running, send_command_blocking};
+
+    if !is_daemon_running() {
+        anyhow::bail!("Daemon not running. Start with: garbg daemon");
+    }
+
+    let response = send_command_blocking(&Command::Resume)?;
+    if response.success {
+        println!("Resumed");
+    } else if let Some(err) = response.error {
+        anyhow::bail!("Failed to resume: {}", err);
+    }
+    Ok(())
+}
+
+fn cmd_toggle() -> Result<()> {
+    use garbg::ipc::{is_daemon_running, send_command_blocking};
+
+    if !is_daemon_running() {
+        anyhow::bail!("Daemon not running. Start with: garbg daemon");
+    }
+
+    let response = send_command_blocking(&Command::Toggle)?;
+    if response.success {
+        if let Some(data) = response.data {
+            if let Some(paused) = data.get("paused").and_then(|v| v.as_bool()) {
+                println!("{}", if paused { "Paused" } else { "Resumed" });
+            }
+        }
+    } else if let Some(err) = response.error {
+        anyhow::bail!("Failed to toggle: {}", err);
+    }
+    Ok(())
+}
+
+fn cmd_query_monitors() -> Result<()> {
+    use garbg::ipc::{is_daemon_running, send_command_blocking};
+
+    if !is_daemon_running() {
+        anyhow::bail!("Daemon not running. Start with: garbg daemon");
+    }
+
+    let response = send_command_blocking(&Command::QueryMonitors)?;
+    if response.success {
+        if let Some(data) = response.data {
+            println!("{}", serde_json::to_string_pretty(&data)?);
+        }
+    } else if let Some(err) = response.error {
+        anyhow::bail!("Failed to query monitors: {}", err);
+    }
+    Ok(())
+}
+
+fn cmd_query_current() -> Result<()> {
+    use garbg::ipc::{is_daemon_running, send_command_blocking};
+
+    if !is_daemon_running() {
+        anyhow::bail!("Daemon not running. Start with: garbg daemon");
+    }
+
+    let response = send_command_blocking(&Command::QueryCurrent)?;
+    if response.success {
+        if let Some(data) = response.data {
+            println!("{}", serde_json::to_string_pretty(&data)?);
+        }
+    } else if let Some(err) = response.error {
+        anyhow::bail!("Failed to query current: {}", err);
+    }
+    Ok(())
+}
+
+fn cmd_set_monitor(monitor: &str, source: &str, mode: &str) -> Result<()> {
+    use garbg::config::ScaleMode;
+    use garbg::ipc::is_daemon_running;
+
+    if !is_daemon_running() {
+        anyhow::bail!("Daemon not running. Start with: garbg daemon");
+    }
+
+    let scale_mode: ScaleMode = mode.parse()?;
+
+    let cmd = Command::SetMonitor {
+        monitor: monitor.to_string(),
+        source: source.to_string(),
+        mode: Some(scale_mode),
+    };
+
+    let response = send_with_spinner(&cmd, &format!("Setting wallpaper on {}...", monitor))?;
+    if response.success {
+        println!("Wallpaper set on {}: {}", monitor, source);
+    } else if let Some(err) = response.error {
+        anyhow::bail!("Failed to set monitor wallpaper: {}", err);
     }
     Ok(())
 }

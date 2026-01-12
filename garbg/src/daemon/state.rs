@@ -14,7 +14,7 @@ use crate::media::{scale_image, AnimatedGif, AnimatedPng, AnimatedWebP, Animatio
 #[cfg(feature = "video")]
 use crate::media::{VideoDecoder, is_video_file};
 use crate::state::{detect_source_type, PlaylistState};
-use crate::x11::{AnimationRenderer, Connection};
+use crate::x11::{AnimationRenderer, Connection, Compositor, Monitor};
 
 use super::pid;
 
@@ -172,15 +172,12 @@ impl Daemon {
     /// Create a new daemon
     ///
     /// Establishes X11 connection and initializes state.
-    /// Fails early with helpful error messages if X11 is unavailable.
+    /// The daemon should be started by systemd after graphical-session.target
+    /// is active, so X11 should already be ready.
     pub fn new(config: Config) -> Result<Self> {
+        // Connect to X11 (fail fast - systemd ensures session is ready)
         let conn = Connection::new()
-            .context("Failed to initialize X11 connection for daemon")?;
-
-        // Verify connection is working
-        if !conn.is_alive() {
-            anyhow::bail!("X11 connection established but not responding");
-        }
+            .context("Failed to connect to X11. Is the graphical session active?")?;
 
         let (width, height) = conn.screen_dimensions();
         tracing::info!("X11 connection established (screen: {}x{})", width, height);
@@ -232,6 +229,14 @@ impl Daemon {
         let server = IpcServer::new().await?;
         tracing::info!("Listening on {}", server.path().display());
 
+        // Notify systemd that we're ready (for Type=notify services)
+        // This ensures gar-session.sh waits until the socket is actually listening
+        if let Err(e) = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]) {
+            tracing::debug!("sd_notify failed (not running under systemd?): {}", e);
+        } else {
+            tracing::debug!("Notified systemd: READY=1");
+        }
+
         // Set initial wallpaper from config if specified
         if !self.state.config.default.source.is_empty() {
             if let Err(e) = self.apply_default_wallpaper() {
@@ -241,6 +246,11 @@ impl Daemon {
 
         // Try to connect to gar (optional)
         let mut gar_client = self.try_connect_gar().await;
+
+        // Reconnection state for gar
+        let mut gar_reconnect_backoff = Duration::from_secs(1);
+        let mut last_gar_reconnect = std::time::Instant::now();
+        let gar_max_backoff = Duration::from_secs(60);
 
         // Track next slideshow time
         let mut next_slideshow: Option<tokio::time::Instant> = self.state.slideshow_interval
@@ -259,8 +269,24 @@ impl Daemon {
         let mut sigint = signal(SignalKind::interrupt())?;
         let mut sighup = signal(SignalKind::hangup())?;
 
+        // Track whether we need to attempt gar reconnection
+        let mut gar_needs_reconnect = gar_client.is_none();
+
         // Main event loop
+        // Note: Session lifecycle is handled by systemd (PartOf=graphical-session.target)
         loop {
+            // Compute reconnection delay (if needed) before select
+            let reconnect_delay = if gar_needs_reconnect {
+                let elapsed = last_gar_reconnect.elapsed();
+                if elapsed < gar_reconnect_backoff {
+                    Some(gar_reconnect_backoff - elapsed)
+                } else {
+                    Some(Duration::ZERO)
+                }
+            } else {
+                None
+            };
+
             tokio::select! {
                 // SIGTERM - graceful shutdown
                 _ = sigterm.recv() => {
@@ -347,7 +373,7 @@ impl Daemon {
                         .map(|d| tokio::time::Instant::now() + d);
                 }
 
-                // gar workspace events (only if connected)
+                // gar workspace/monitor events (only if connected)
                 event = async {
                     if let Some(ref mut client) = gar_client {
                         client.read_event().await
@@ -357,6 +383,8 @@ impl Daemon {
                 } => {
                     match event {
                         Ok(event) => {
+                            // Reset backoff on successful event
+                            gar_reconnect_backoff = Duration::from_secs(1);
                             if let Err(e) = self.handle_gar_event(event) {
                                 tracing::warn!("gar event handling failed: {}", e);
                             }
@@ -364,6 +392,34 @@ impl Daemon {
                         Err(e) => {
                             tracing::debug!("gar connection lost: {}", e);
                             gar_client = None;
+                            gar_needs_reconnect = true;
+                            last_gar_reconnect = std::time::Instant::now();
+                        }
+                    }
+                }
+
+                // gar reconnection timer (only when disconnected)
+                _ = async {
+                    if let Some(delay) = reconnect_delay {
+                        tokio::time::sleep(delay).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    tracing::debug!("Attempting to reconnect to gar...");
+                    last_gar_reconnect = std::time::Instant::now();
+
+                    match self.try_connect_gar().await {
+                        Some(client) => {
+                            gar_client = Some(client);
+                            gar_needs_reconnect = false;
+                            gar_reconnect_backoff = Duration::from_secs(1);
+                            tracing::info!("Reconnected to gar");
+                        }
+                        None => {
+                            // Exponential backoff, max 60 seconds
+                            gar_reconnect_backoff = (gar_reconnect_backoff * 2).min(gar_max_backoff);
+                            tracing::debug!("gar reconnection failed, next attempt in {:?}", gar_reconnect_backoff);
                         }
                     }
                 }
@@ -518,7 +574,7 @@ impl Daemon {
             Command::Toggle => {
                 self.state.paused = !self.state.paused;
                 tracing::info!("Slideshow {}", if self.state.paused { "paused" } else { "resumed" });
-                Response::ok()
+                Response::ok_with_data(serde_json::json!({ "paused": self.state.paused }))
             }
             Command::Reload => {
                 match self.reload_config() {
@@ -549,6 +605,21 @@ impl Daemon {
                 // Subscriptions not yet implemented
                 Response::error("Subscriptions not yet implemented")
             }
+            Command::QueryMonitors => {
+                let monitors = self.get_monitors();
+                Response::ok_with_data(serde_json::json!({ "monitors": monitors }))
+            }
+            Command::QueryCurrent => {
+                let current = self.get_current_wallpaper_info();
+                Response::ok_with_data(current)
+            }
+            Command::SetMonitor { monitor, source, mode } => {
+                let scale_mode = mode.unwrap_or(self.state.config.general.mode);
+                match self.set_monitor_wallpaper(&monitor, &source, scale_mode) {
+                    Ok(_) => Response::ok(),
+                    Err(e) => Response::error(e.to_string()),
+                }
+            }
         }
     }
 
@@ -560,8 +631,8 @@ impl Daemon {
                 self.on_workspace_change(current)?;
             }
             GarEvent::Monitor { name, action } => {
-                tracing::debug!("Monitor {}: {}", action, name);
-                // TODO: Handle monitor changes
+                tracing::info!("Monitor event: {} {}", name, action);
+                self.on_monitor_change(&name, &action)?;
             }
             GarEvent::Focus { .. } => {
                 // Ignore focus events
@@ -573,12 +644,70 @@ impl Daemon {
         Ok(())
     }
 
+    /// Handle monitor hotplug event from gar
+    fn on_monitor_change(&mut self, name: &str, action: &str) -> Result<()> {
+        match action {
+            "added" => {
+                tracing::info!("Monitor added: {} - re-applying wallpapers", name);
+                // Re-apply wallpapers to all monitors when one is added
+                // This ensures the new monitor gets a wallpaper
+                self.refresh_wallpapers()?;
+            }
+            "removed" => {
+                tracing::info!("Monitor removed: {}", name);
+                // Remove monitor from our state if we're tracking per-monitor wallpapers
+                self.state.monitors.remove(name);
+            }
+            "changed" => {
+                tracing::info!("Monitor changed: {} - re-applying wallpapers", name);
+                // Resolution or position changed, re-apply wallpapers
+                self.refresh_wallpapers()?;
+            }
+            _ => {
+                tracing::debug!("Unknown monitor action: {} for {}", action, name);
+            }
+        }
+        Ok(())
+    }
+
+    /// Refresh wallpapers on all monitors
+    fn refresh_wallpapers(&mut self) -> Result<()> {
+        // If we have an active animation, restart it (picks up new screen size)
+        if self.animation.is_some() {
+            tracing::debug!("Active animation detected, will restart on next frame");
+            // Animation will pick up new screen dimensions on next render
+        }
+
+        // Check if we have per-monitor wallpapers
+        let monitors = Monitor::get_all(&self.conn).unwrap_or_default();
+
+        if monitors.len() > 1 && !self.state.monitors.is_empty() {
+            // Multiple monitors with per-monitor wallpapers: use compositor
+            self.composite_all_wallpapers(&monitors)?;
+            tracing::debug!("Wallpapers refreshed (composited {} monitors)", monitors.len());
+        } else if let Some(ref playlist) = self.state.playlist {
+            // Single monitor or no per-monitor state: use global wallpaper
+            if let Some(current) = playlist.current() {
+                let mode = playlist.mode;
+                let current = current.to_string();
+                self.set_wallpaper(&current, mode)?;
+                tracing::debug!("Wallpapers refreshed");
+            }
+        } else if !self.state.config.default.source.is_empty() {
+            // Fall back to default wallpaper
+            self.apply_default_wallpaper()?;
+        }
+
+        Ok(())
+    }
+
     /// Try to connect to gar IPC
     async fn try_connect_gar(&self) -> Option<GarIpcClient> {
         match GarIpcClient::connect().await {
             Ok(mut client) => {
-                if client.subscribe(&["workspace"]).await.is_ok() {
-                    tracing::info!("Connected to gar IPC");
+                // Subscribe to workspace and monitor events
+                if client.subscribe(&["workspace", "monitor"]).await.is_ok() {
+                    tracing::info!("Connected to gar IPC (subscribed to workspace, monitor events)");
                     Some(client)
                 } else {
                     tracing::debug!("Failed to subscribe to gar events");
@@ -1087,6 +1216,199 @@ impl Daemon {
 
         images.sort();
         Ok(images)
+    }
+
+    /// Get connected monitors info via RandR
+    fn get_monitors(&self) -> Vec<serde_json::Value> {
+        match Monitor::get_all(&self.conn) {
+            Ok(monitors) if !monitors.is_empty() => {
+                monitors.iter().map(|m| {
+                    serde_json::json!({
+                        "name": m.name,
+                        "width": m.width,
+                        "height": m.height,
+                        "x": m.x,
+                        "y": m.y,
+                        "primary": m.primary,
+                    })
+                }).collect()
+            }
+            Ok(_) => {
+                // No monitors detected, fall back to screen dimensions
+                tracing::debug!("No monitors detected via RandR, using screen dimensions");
+                let (width, height) = self.conn.screen_dimensions();
+                vec![serde_json::json!({
+                    "name": "default",
+                    "width": width,
+                    "height": height,
+                    "x": 0,
+                    "y": 0,
+                    "primary": true,
+                })]
+            }
+            Err(e) => {
+                // RandR failed, fall back to screen dimensions
+                tracing::warn!("RandR detection failed: {}, using screen dimensions", e);
+                let (width, height) = self.conn.screen_dimensions();
+                vec![serde_json::json!({
+                    "name": "default",
+                    "width": width,
+                    "height": height,
+                    "x": 0,
+                    "y": 0,
+                    "primary": true,
+                })]
+            }
+        }
+    }
+
+    /// Get current wallpaper info
+    fn get_current_wallpaper_info(&self) -> serde_json::Value {
+        let current_image = self.state.playlist.as_ref()
+            .and_then(|p| p.current().map(|s| s.to_string()));
+
+        let mode = self.state.playlist.as_ref()
+            .map(|p| format!("{}", p.mode))
+            .unwrap_or_else(|| format!("{}", self.state.config.general.mode));
+
+        let animation_active = self.animation.is_some();
+
+        serde_json::json!({
+            "source": current_image,
+            "mode": mode,
+            "paused": self.state.paused,
+            "animation_active": animation_active,
+            "workspace": self.state.current_workspace,
+        })
+    }
+
+    /// Set wallpaper for a specific monitor
+    fn set_monitor_wallpaper(&mut self, monitor_name: &str, source: &str, mode: ScaleMode) -> Result<()> {
+        // Get detected monitors
+        let monitors = Monitor::get_all(&self.conn)?;
+
+        if monitors.is_empty() {
+            // Fall back to setting global wallpaper if no monitors detected
+            tracing::warn!("No monitors detected, setting wallpaper globally");
+            return self.set_wallpaper(source, mode);
+        }
+
+        // Find the target monitor
+        let target_monitor = monitors.iter()
+            .find(|m| m.name == monitor_name)
+            .ok_or_else(|| anyhow::anyhow!(
+                "Monitor '{}' not found. Available: {:?}",
+                monitor_name,
+                monitors.iter().map(|m| &m.name).collect::<Vec<_>>()
+            ))?;
+
+        // Load and scale the image for this monitor
+        let expanded = shellexpand::tilde(source);
+        let image = ImageLoader::load_file(expanded.as_ref())?;
+
+        // Store wallpaper state for this monitor
+        self.state.monitors.insert(monitor_name.to_string(), MonitorWallpaper {
+            name: monitor_name.to_string(),
+            source: source.to_string(),
+            mode,
+        });
+
+        tracing::info!(
+            "Set wallpaper for monitor {}: {} (mode: {})",
+            monitor_name,
+            source,
+            mode
+        );
+
+        // If only one monitor, set wallpaper directly
+        if monitors.len() == 1 {
+            let scaled = scale_image(
+                &image,
+                target_monitor.width as u32,
+                target_monitor.height as u32,
+                mode,
+            );
+            return self.conn.set_wallpaper(&scaled);
+        }
+
+        // Multiple monitors: composite all wallpapers
+        self.composite_all_wallpapers(&monitors)
+    }
+
+    /// Composite wallpapers for all monitors and set the result
+    fn composite_all_wallpapers(&mut self, monitors: &[Monitor]) -> Result<()> {
+        if monitors.is_empty() {
+            return Ok(());
+        }
+
+        let compositor = Compositor::new(monitors);
+        let mut wallpapers = Vec::new();
+
+        // Get global default wallpaper for monitors without specific wallpaper
+        let default_image = if !self.state.config.default.source.is_empty() {
+            let expanded = shellexpand::tilde(&self.state.config.default.source);
+            ImageLoader::load_file(expanded.as_ref()).ok()
+        } else if let Some(ref playlist) = self.state.playlist {
+            playlist.current()
+                .and_then(|path| {
+                    let expanded = shellexpand::tilde(path);
+                    ImageLoader::load_file(expanded.as_ref()).ok()
+                })
+        } else {
+            None
+        };
+
+        for monitor in monitors {
+            let image = if let Some(wp_state) = self.state.monitors.get(&monitor.name) {
+                // Use the per-monitor wallpaper
+                let expanded = shellexpand::tilde(&wp_state.source);
+                match ImageLoader::load_file(expanded.as_ref()) {
+                    Ok(img) => img,
+                    Err(e) => {
+                        tracing::warn!("Failed to load wallpaper for {}: {}", monitor.name, e);
+                        if let Some(ref def) = default_image {
+                            def.clone()
+                        } else {
+                            // Create a black image as fallback
+                            image::RgbaImage::from_pixel(
+                                monitor.width as u32,
+                                monitor.height as u32,
+                                image::Rgba([0, 0, 0, 255])
+                            )
+                        }
+                    }
+                }
+            } else if let Some(ref def) = default_image {
+                // Use the default wallpaper
+                def.clone()
+            } else {
+                // No wallpaper, use black
+                image::RgbaImage::from_pixel(
+                    monitor.width as u32,
+                    monitor.height as u32,
+                    image::Rgba([0, 0, 0, 255])
+                )
+            };
+
+            let mode = self.state.monitors.get(&monitor.name)
+                .map(|wp| wp.mode)
+                .unwrap_or(self.state.config.general.mode);
+
+            wallpapers.push(Compositor::create_monitor_wallpaper(monitor, &image, mode));
+        }
+
+        // Composite and set
+        let composited = compositor.composite(&wallpapers);
+        self.conn.set_wallpaper(&composited)?;
+
+        tracing::debug!(
+            "Composited {} monitors ({}x{})",
+            monitors.len(),
+            compositor.total_width,
+            compositor.total_height
+        );
+
+        Ok(())
     }
 }
 
