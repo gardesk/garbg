@@ -223,6 +223,49 @@ impl Daemon {
         self.conn.as_mut().ok_or_else(|| anyhow::anyhow!("X11 connection not available"))
     }
 
+    /// Attempt to establish/re-establish X11 connection
+    fn try_connect_x11(&mut self) -> bool {
+        match Connection::new() {
+            Ok(conn) => {
+                let (width, height) = conn.screen_dimensions();
+                tracing::info!("X11 connection established (screen: {}x{})", width, height);
+                self.conn = Some(conn);
+                true
+            }
+            Err(e) => {
+                tracing::debug!("X11 connection failed: {}", e);
+                false
+            }
+        }
+    }
+
+    /// Check if X11 connection is alive
+    fn x11_is_alive(&self) -> bool {
+        self.conn.as_ref().map(|c| c.is_alive()).unwrap_or(false)
+    }
+
+    /// Re-apply current wallpaper after X11 reconnection
+    fn reapply_wallpaper(&mut self) -> Result<()> {
+        // Stop any animation (it had the old connection's renderer)
+        self.animation = None;
+
+        // Re-apply from playlist if we have one
+        if let Some(ref playlist) = self.state.playlist {
+            if let Some(current) = playlist.current() {
+                let source = current.to_string();
+                let mode = playlist.mode;
+                return self.set_wallpaper(&source, mode);
+            }
+        }
+
+        // Otherwise try to re-apply default wallpaper
+        if !self.state.config.default.source.is_empty() {
+            return self.apply_default_wallpaper();
+        }
+
+        Ok(())
+    }
+
     /// Run the daemon event loop
     pub async fn run(&mut self) -> Result<()> {
         // Check for stale PID file and clean up
