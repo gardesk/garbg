@@ -155,8 +155,8 @@ impl ActiveAnimation {
 
 /// Main daemon struct
 pub struct Daemon {
-    /// X11 connection
-    conn: Connection,
+    /// X11 connection (None if disconnected, will attempt reconnect)
+    conn: Option<Connection>,
 
     /// Daemon state
     state: DaemonState,
@@ -206,11 +206,21 @@ impl Daemon {
         let state = DaemonState::new(config);
 
         Ok(Self {
-            conn,
+            conn: Some(conn),
             state,
             animation: None,
             cache,
         })
+    }
+
+    /// Get a reference to the X11 connection, or error if disconnected
+    fn conn(&self) -> Result<&Connection> {
+        self.conn.as_ref().ok_or_else(|| anyhow::anyhow!("X11 connection not available"))
+    }
+
+    /// Get a mutable reference to the X11 connection, or error if disconnected
+    fn conn_mut(&mut self) -> Result<&mut Connection> {
+        self.conn.as_mut().ok_or_else(|| anyhow::anyhow!("X11 connection not available"))
     }
 
     /// Run the daemon event loop
