@@ -546,12 +546,15 @@ impl Daemon {
 
     /// Render the next animation frame
     fn render_animation_frame(&mut self) -> Result<()> {
+        // Access both fields directly to allow split borrowing
+        let conn = self.conn.as_mut()
+            .ok_or_else(|| anyhow::anyhow!("X11 connection not available"))?;
         let anim = self.animation.as_mut()
             .ok_or_else(|| anyhow::anyhow!("No active animation"))?;
 
         // Render current frame
         let frame = &anim.scaled_frames[anim.current_frame];
-        anim.renderer.render_and_present(&mut self.conn, frame)?;
+        anim.renderer.render_and_present(conn, frame)?;
 
         // Advance to next frame
         anim.advance();
@@ -791,7 +794,11 @@ impl Daemon {
         }
 
         // Check if we have per-monitor wallpapers
-        let monitors = Monitor::get_all(&self.conn).unwrap_or_default();
+        let conn = match self.conn() {
+            Ok(c) => c,
+            Err(_) => return Ok(()), // No connection, nothing to refresh
+        };
+        let monitors = Monitor::get_all(conn).unwrap_or_default();
 
         if monitors.len() > 1 && !self.state.monitors.is_empty() {
             // Multiple monitors with per-monitor wallpapers: use compositor
@@ -931,8 +938,9 @@ impl Daemon {
         let _ = is_video;
 
         // Create animation renderer
-        let renderer = AnimationRenderer::new(&self.conn)?;
-        let (width, height) = self.conn.screen_dimensions();
+        let conn = self.conn()?;
+        let renderer = AnimationRenderer::new(conn)?;
+        let (width, height) = conn.screen_dimensions();
 
         tracing::info!(
             "Animation loaded: {} frames, {:.1} FPS ({})",
@@ -1002,8 +1010,9 @@ impl Daemon {
         let avg_fps = info.frame_rate;
 
         // Create animation renderer
-        let renderer = AnimationRenderer::new(&self.conn)?;
-        let (width, height) = self.conn.screen_dimensions();
+        let conn = self.conn()?;
+        let renderer = AnimationRenderer::new(conn)?;
+        let (width, height) = conn.screen_dimensions();
 
         tracing::info!(
             "Video loaded: {} frames, {:.1} FPS",
@@ -1119,9 +1128,10 @@ impl Daemon {
         } else if source.starts_with("http://") || source.starts_with("https://") {
             // Remote URL
             let image = self.fetch_image(source)?;
-            let (width, height) = self.conn.screen_dimensions();
+            let conn = self.conn_mut()?;
+            let (width, height) = conn.screen_dimensions();
             let scaled = scale_image(&image, width as u32, height as u32, mode);
-            self.conn.set_wallpaper(&scaled)?;
+            conn.set_wallpaper(&scaled)?;
             tracing::info!("Wallpaper set: {} (mode: {})", source, mode);
         } else {
             // Single file
@@ -1135,9 +1145,10 @@ impl Daemon {
     pub fn set_wallpaper(&mut self, source: &str, mode: ScaleMode) -> Result<()> {
         let expanded = shellexpand::tilde(source);
         let image = ImageLoader::load_file(expanded.as_ref())?;
-        let (width, height) = self.conn.screen_dimensions();
+        let conn = self.conn_mut()?;
+        let (width, height) = conn.screen_dimensions();
         let scaled = scale_image(&image, width as u32, height as u32, mode);
-        self.conn.set_wallpaper(&scaled)?;
+        conn.set_wallpaper(&scaled)?;
 
         tracing::info!("Wallpaper set: {} (mode: {})", source, mode);
 
@@ -1332,7 +1343,22 @@ impl Daemon {
 
     /// Get connected monitors info via RandR
     fn get_monitors(&self) -> Vec<serde_json::Value> {
-        match Monitor::get_all(&self.conn) {
+        let conn = match self.conn.as_ref() {
+            Some(c) => c,
+            None => {
+                tracing::warn!("X11 connection not available for monitor detection");
+                return vec![serde_json::json!({
+                    "name": "default",
+                    "width": 1920,
+                    "height": 1080,
+                    "x": 0,
+                    "y": 0,
+                    "primary": true,
+                })];
+            }
+        };
+
+        match Monitor::get_all(conn) {
             Ok(monitors) if !monitors.is_empty() => {
                 monitors.iter().map(|m| {
                     serde_json::json!({
@@ -1348,7 +1374,7 @@ impl Daemon {
             Ok(_) => {
                 // No monitors detected, fall back to screen dimensions
                 tracing::debug!("No monitors detected via RandR, using screen dimensions");
-                let (width, height) = self.conn.screen_dimensions();
+                let (width, height) = conn.screen_dimensions();
                 vec![serde_json::json!({
                     "name": "default",
                     "width": width,
@@ -1361,7 +1387,7 @@ impl Daemon {
             Err(e) => {
                 // RandR failed, fall back to screen dimensions
                 tracing::warn!("RandR detection failed: {}, using screen dimensions", e);
-                let (width, height) = self.conn.screen_dimensions();
+                let (width, height) = conn.screen_dimensions();
                 vec![serde_json::json!({
                     "name": "default",
                     "width": width,
@@ -1397,7 +1423,7 @@ impl Daemon {
     /// Set wallpaper for a specific monitor
     fn set_monitor_wallpaper(&mut self, monitor_name: &str, source: &str, mode: ScaleMode) -> Result<()> {
         // Get detected monitors
-        let monitors = Monitor::get_all(&self.conn)?;
+        let monitors = Monitor::get_all(self.conn()?)?;
 
         if monitors.is_empty() {
             // Fall back to setting global wallpaper if no monitors detected
@@ -1440,7 +1466,7 @@ impl Daemon {
                 target_monitor.height as u32,
                 mode,
             );
-            return self.conn.set_wallpaper(&scaled);
+            return self.conn_mut()?.set_wallpaper(&scaled);
         }
 
         // Multiple monitors: composite all wallpapers
@@ -1511,7 +1537,7 @@ impl Daemon {
 
         // Composite and set
         let composited = compositor.composite(&wallpapers);
-        self.conn.set_wallpaper(&composited)?;
+        self.conn_mut()?.set_wallpaper(&composited)?;
 
         tracing::debug!(
             "Composited {} monitors ({}x{})",
