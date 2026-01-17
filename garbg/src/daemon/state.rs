@@ -305,6 +305,14 @@ impl Daemon {
         let mut last_gar_reconnect = std::time::Instant::now();
         let gar_max_backoff = Duration::from_secs(60);
 
+        // X11 health check and reconnection state
+        let x11_health_interval = Duration::from_secs(5);
+        let mut last_x11_health_check = std::time::Instant::now();
+        let mut x11_reconnect_backoff = Duration::from_secs(1);
+        let mut last_x11_reconnect = std::time::Instant::now();
+        let x11_max_backoff = Duration::from_secs(30);
+        let mut x11_needs_reconnect = false;
+
         // Track next slideshow time
         let mut next_slideshow: Option<tokio::time::Instant> = self.state.slideshow_interval
             .map(|d| tokio::time::Instant::now() + d);
@@ -328,7 +336,31 @@ impl Daemon {
         // Main event loop
         // Note: Session lifecycle is handled by systemd (PartOf=graphical-session.target)
         loop {
-            // Compute reconnection delay (if needed) before select
+            // X11 health check (periodic, only if connected)
+            if !x11_needs_reconnect && last_x11_health_check.elapsed() >= x11_health_interval {
+                last_x11_health_check = std::time::Instant::now();
+                if !self.x11_is_alive() {
+                    tracing::warn!("X11 connection lost, will attempt reconnect");
+                    self.conn = None;
+                    self.animation = None; // Animation renderer is now invalid
+                    x11_needs_reconnect = true;
+                    last_x11_reconnect = std::time::Instant::now();
+                }
+            }
+
+            // Compute X11 reconnection delay
+            let x11_reconnect_delay = if x11_needs_reconnect {
+                let elapsed = last_x11_reconnect.elapsed();
+                if elapsed < x11_reconnect_backoff {
+                    Some(x11_reconnect_backoff - elapsed)
+                } else {
+                    Some(Duration::ZERO)
+                }
+            } else {
+                None
+            };
+
+            // Compute gar reconnection delay (if needed) before select
             let reconnect_delay = if gar_needs_reconnect {
                 let elapsed = last_gar_reconnect.elapsed();
                 if elapsed < gar_reconnect_backoff {
@@ -448,6 +480,33 @@ impl Daemon {
                             gar_needs_reconnect = true;
                             last_gar_reconnect = std::time::Instant::now();
                         }
+                    }
+                }
+
+                // X11 reconnection timer (only when disconnected)
+                _ = async {
+                    if let Some(delay) = x11_reconnect_delay {
+                        tokio::time::sleep(delay).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    tracing::debug!("Attempting to reconnect to X11...");
+                    last_x11_reconnect = std::time::Instant::now();
+
+                    if self.try_connect_x11() {
+                        x11_needs_reconnect = false;
+                        x11_reconnect_backoff = Duration::from_secs(1);
+                        tracing::info!("Reconnected to X11");
+
+                        // Re-apply wallpaper after reconnection
+                        if let Err(e) = self.reapply_wallpaper() {
+                            tracing::warn!("Failed to re-apply wallpaper after X11 reconnect: {}", e);
+                        }
+                    } else {
+                        // Exponential backoff, max 30 seconds
+                        x11_reconnect_backoff = (x11_reconnect_backoff * 2).min(x11_max_backoff);
+                        tracing::debug!("X11 reconnection failed, next attempt in {:?}", x11_reconnect_backoff);
                     }
                 }
 
