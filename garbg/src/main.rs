@@ -464,6 +464,20 @@ fn set_single_wallpaper(
 
 /// Advance to the next image in the playlist
 fn cmd_next() -> Result<()> {
+    use garbg::ipc::{is_daemon_running, send_command_blocking};
+
+    // If daemon is running, delegate to it (preserves pixmap lifetime)
+    if is_daemon_running() {
+        let response = send_command_blocking(&Command::Next { monitor: None })?;
+        if response.success {
+            // Daemon handles logging
+            return Ok(());
+        } else if let Some(err) = response.error {
+            anyhow::bail!("Daemon error: {}", err);
+        }
+    }
+
+    // Fallback: no daemon running, set directly (pixmap will be freed on exit)
     let mut state = PlaylistState::load()?
         .ok_or_else(|| anyhow::anyhow!("No active playlist. Use 'garbg set <directory>' first."))?;
 
@@ -485,6 +499,20 @@ fn cmd_next() -> Result<()> {
 
 /// Go back to the previous image in the playlist
 fn cmd_prev() -> Result<()> {
+    use garbg::ipc::{is_daemon_running, send_command_blocking};
+
+    // If daemon is running, delegate to it (preserves pixmap lifetime)
+    if is_daemon_running() {
+        let response = send_command_blocking(&Command::Prev { monitor: None })?;
+        if response.success {
+            // Daemon handles logging
+            return Ok(());
+        } else if let Some(err) = response.error {
+            anyhow::bail!("Daemon error: {}", err);
+        }
+    }
+
+    // Fallback: no daemon running, set directly (pixmap will be freed on exit)
     let mut state = PlaylistState::load()?
         .ok_or_else(|| anyhow::anyhow!("No active playlist. Use 'garbg set <directory>' first."))?;
 
