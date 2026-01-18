@@ -455,7 +455,16 @@ fn set_single_wallpaper(
     }
 
     // Static image handling
+    use garbg::x11::CloseDownMode;
+
     let mut conn = Connection::new()?;
+
+    // Use RetainPermanent mode so the pixmap survives after we exit.
+    // This prevents black backgrounds when garbar reloads or screen redraws occur.
+    conn.set_close_down_mode(CloseDownMode::RetainPermanent)?;
+
+    // Clean up any old pixmap from previous garbg runs
+    conn.cleanup_old_pixmap()?;
 
     let image = if source.starts_with("http://") || source.starts_with("https://") {
         fetch_image_from_url(source)?

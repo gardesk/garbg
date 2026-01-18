@@ -55,6 +55,15 @@ impl Atoms {
     }
 }
 
+/// Close-down mode for X11 connections
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseDownMode {
+    /// Free all resources when client disconnects (default)
+    Destroy,
+    /// Keep resources alive after client disconnects (for wallpaper persistence)
+    RetainPermanent,
+}
+
 /// X11 connection wrapper for garbg
 pub struct Connection {
     conn: RustConnection,
@@ -66,6 +75,8 @@ pub struct Connection {
     atoms: Atoms,
     /// Currently set root pixmap (if any)
     current_pixmap: Option<Pixmap>,
+    /// Close-down mode (determines if pixmap survives client disconnect)
+    close_down_mode: CloseDownMode,
 }
 
 impl Connection {
@@ -111,7 +122,57 @@ impl Connection {
             gc,
             atoms,
             current_pixmap: None,
+            close_down_mode: CloseDownMode::Destroy,
         })
+    }
+
+    /// Set the close-down mode for this connection.
+    ///
+    /// - `Destroy`: Free all resources when client disconnects (default, good for daemons)
+    /// - `RetainPermanent`: Keep pixmap alive after disconnect (good for one-shot commands)
+    ///
+    /// When using `RetainPermanent`, the pixmap will persist and garbg will clean up
+    /// old pixmaps from previous runs by reading `_XROOTPMAP_ID`.
+    pub fn set_close_down_mode(&mut self, mode: CloseDownMode) -> Result<()> {
+        self.close_down_mode = mode;
+
+        let x11_mode = match mode {
+            CloseDownMode::Destroy => x11rb::protocol::xproto::CloseDown::DESTROY_ALL,
+            CloseDownMode::RetainPermanent => x11rb::protocol::xproto::CloseDown::RETAIN_PERMANENT,
+        };
+
+        self.conn.set_close_down_mode(x11_mode)?;
+        self.conn.flush()?;
+
+        Ok(())
+    }
+
+    /// Clean up any pixmap left by a previous garbg run.
+    ///
+    /// This reads the pixmap ID from `_XROOTPMAP_ID` and frees it if it exists.
+    /// Should be called before setting a new wallpaper when using `RetainPermanent` mode.
+    pub fn cleanup_old_pixmap(&self) -> Result<()> {
+        // Try to read the old pixmap ID from the root window property
+        let reply = self.conn.get_property(
+            false,
+            self.root,
+            self.atoms.xrootpmap_id,
+            AtomEnum::PIXMAP,
+            0,
+            1,
+        )?.reply()?;
+
+        if reply.format == 32 && reply.length == 1 {
+            if let Some(pixmap_id) = reply.value32().and_then(|mut iter| iter.next()) {
+                if pixmap_id != 0 {
+                    // Kill the old pixmap (ignore errors - it might already be freed)
+                    let _ = self.conn.kill_client(pixmap_id);
+                    tracing::debug!("Cleaned up old pixmap: {}", pixmap_id);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Get screen dimensions (width, height)
@@ -253,9 +314,12 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        // Clean up the pixmap when we're done
-        if let Some(pixmap) = self.current_pixmap.take() {
-            let _ = self.conn.free_pixmap(pixmap);
+        // Only clean up the pixmap if we're in Destroy mode.
+        // In RetainPermanent mode, we leave it alive for persistence.
+        if self.close_down_mode == CloseDownMode::Destroy {
+            if let Some(pixmap) = self.current_pixmap.take() {
+                let _ = self.conn.free_pixmap(pixmap);
+            }
         }
         let _ = self.conn.free_gc(self.gc);
     }

@@ -9,7 +9,7 @@ mod monitors;
 mod animation;
 mod compositor;
 
-pub use connection::{Connection, X11Error};
+pub use connection::{Connection, X11Error, CloseDownMode};
 pub use renderer::Renderer;
 pub use monitors::Monitor;
 pub use animation::{AnimationRenderer, DoubleBuffer};
