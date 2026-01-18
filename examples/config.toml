@@ -1,0 +1,18 @@
+# garbg configuration
+# See https://github.com/tenseleyFlow/garbg for documentation
+
+[general]
+mode = "fill"
+
+# Default wallpaper (optional - gar init.lua handles this)
+# [default]
+# source = "~/Pictures/background/cold/"
+# mode = "fill"
+# [default.slideshow]
+# enabled = false
+# interval = "5m"
+# shuffle = true
+
+[cache]
+max_size_mb = 1024
+max_age_days = 30
