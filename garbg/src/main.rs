@@ -53,6 +53,10 @@ enum Commands {
         /// Max FPS for animations (default: 60)
         #[arg(long, default_value = "60")]
         max_fps: u32,
+
+        /// Span wallpaper across all monitors (default: per-monitor)
+        #[arg(long)]
+        span: bool,
     },
 
     /// Advance to the next image in the playlist
@@ -142,8 +146,8 @@ fn main() -> Result<()> {
         .init();
 
     match cli.command {
-        Commands::Set { source, mode, monitor, random, interval, animate, max_fps } => {
-            set_wallpaper(&source, &mode, monitor.as_deref(), random, interval, animate, max_fps)?;
+        Commands::Set { source, mode, monitor, random, interval, animate, max_fps, span } => {
+            set_wallpaper(&source, &mode, monitor.as_deref(), random, interval, animate, max_fps, span)?;
         }
         Commands::Next => {
             cmd_next()?;
@@ -220,6 +224,7 @@ fn set_wallpaper(
     interval: Option<Duration>,
     animate: bool,
     max_fps: u32,
+    span: bool,
 ) -> Result<()> {
     use garbg::config::ScaleMode;
     use garbg::ipc::send_command_blocking;
@@ -240,6 +245,7 @@ fn set_wallpaper(
         shuffle: random,
         animate,
         max_fps,
+        span,
     };
 
     // Try to send to daemon (should be ready if systemd started it correctly)
@@ -316,7 +322,7 @@ fn set_wallpaper(
     }
 
     // Set the initial wallpaper (handles animated GIFs automatically)
-    set_single_wallpaper(&resolved_source, scale_mode, animate, max_fps)?;
+    set_single_wallpaper(&resolved_source, scale_mode, animate, max_fps, span)?;
 
     // If interval specified and daemon not running, enter foreground rotation loop
     // Note: --interval mode doesn't support animations (would require stopping animation to rotate)
@@ -338,7 +344,7 @@ fn set_wallpaper(
                 playlist_state.save()?;
 
                 // Static mode for rotation (animation would conflict)
-                set_single_wallpaper(&next_img, playlist_state.mode, false, 60)?;
+                set_single_wallpaper(&next_img, playlist_state.mode, false, 60, span)?;
                 tracing::info!(
                     "Rotated to [{}/{}]: {}",
                     playlist_state.current_index + 1,
@@ -358,15 +364,19 @@ fn set_wallpaper(
 ///
 /// If `animate` is true and the source is an animated GIF, this will block
 /// and play the animation until interrupted (Ctrl+C).
+///
+/// If `span` is true, the wallpaper is stretched across all monitors.
+/// If `span` is false (default), the wallpaper is scaled to each monitor individually.
 fn set_single_wallpaper(
     source: &str,
     mode: garbg::config::ScaleMode,
     animate: bool,
     max_fps: u32,
+    span: bool,
 ) -> Result<()> {
     use garbg::daemon::{AnimationConfig, AnimationLoop};
     use garbg::media::{AnimatedGif, ImageLoader};
-    use garbg::x11::Connection;
+    use garbg::x11::{Connection, Compositor, Monitor};
 
     tracing::info!("Setting wallpaper: {}", source);
 
@@ -453,11 +463,30 @@ fn set_single_wallpaper(
         ImageLoader::load_file(source)?
     };
 
-    let (width, height) = conn.screen_dimensions();
-    let scaled = garbg::media::scale_image(&image, width as u32, height as u32, mode);
-    conn.set_wallpaper(&scaled)?;
+    // Check for multiple monitors
+    let monitors = Monitor::get_all(&conn).unwrap_or_default();
 
-    tracing::info!("Wallpaper set: {} ({}x{}, mode: {:?})", source, width, height, mode);
+    if !span && monitors.len() > 1 {
+        // Per-monitor mode: scale wallpaper to each monitor individually
+        let compositor = Compositor::new(&monitors);
+        let wallpapers = Compositor::create_wallpapers_uniform(&monitors, &image, mode);
+        let composited = compositor.composite(&wallpapers);
+        conn.set_wallpaper(&composited)?;
+
+        tracing::info!(
+            "Wallpaper set on {} monitors: {} (mode: {:?})",
+            monitors.len(),
+            source,
+            mode
+        );
+    } else {
+        // Span mode or single monitor: scale to full screen
+        let (width, height) = conn.screen_dimensions();
+        let scaled = garbg::media::scale_image(&image, width as u32, height as u32, mode);
+        conn.set_wallpaper(&scaled)?;
+
+        tracing::info!("Wallpaper set: {} ({}x{}, mode: {:?})", source, width, height, mode);
+    }
 
     Ok(())
 }
@@ -484,8 +513,8 @@ fn cmd_next() -> Result<()> {
     let next_image = state.next().to_string();
     state.save()?;
 
-    // No animation for quick navigation commands
-    set_single_wallpaper(&next_image, state.mode, false, 60)?;
+    // No animation for quick navigation commands, default to per-monitor
+    set_single_wallpaper(&next_image, state.mode, false, 60, false)?;
 
     tracing::info!(
         "Next [{}/{}]: {}",
@@ -519,8 +548,8 @@ fn cmd_prev() -> Result<()> {
     let prev_image = state.prev().to_string();
     state.save()?;
 
-    // No animation for quick navigation commands
-    set_single_wallpaper(&prev_image, state.mode, false, 60)?;
+    // No animation for quick navigation commands, default to per-monitor
+    set_single_wallpaper(&prev_image, state.mode, false, 60, false)?;
 
     tracing::info!(
         "Prev [{}/{}]: {}",

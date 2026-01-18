@@ -32,6 +32,9 @@ pub enum Command {
         /// Max FPS for animations (default: 60)
         #[serde(default = "default_max_fps")]
         max_fps: u32,
+        /// Span wallpaper across all monitors (default: false, per-monitor)
+        #[serde(default)]
+        span: bool,
     },
 
     /// Set wallpaper for a specific workspace

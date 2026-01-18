@@ -578,7 +578,7 @@ impl Daemon {
     /// Handle an IPC command
     fn handle_command(&mut self, cmd: Command) -> Response {
         match cmd {
-            Command::Set { source, mode, monitor: _, interval_secs, shuffle, animate, max_fps } => {
+            Command::Set { source, mode, monitor: _, interval_secs, shuffle, animate, max_fps, span } => {
                 let scale_mode = mode.unwrap_or(self.state.config.general.mode);
 
                 // Stop any existing animation first
@@ -629,7 +629,7 @@ impl Daemon {
                 }
 
                 // Set up slideshow with the new source (static image)
-                match self.set_wallpaper_with_options(&source, scale_mode, shuffle, interval_secs) {
+                match self.set_wallpaper_with_options(&source, scale_mode, shuffle, interval_secs, span) {
                     Ok(_) => {
                         // Update slideshow interval
                         self.state.slideshow_interval = interval_secs.map(Duration::from_secs);
@@ -645,9 +645,9 @@ impl Daemon {
             }
             Command::SetWorkspace { workspace, source, mode } => {
                 let scale_mode = mode.unwrap_or(self.state.config.general.mode);
-                // Only set if we're on this workspace
+                // Only set if we're on this workspace (default to per-monitor)
                 if self.state.current_workspace == workspace {
-                    match self.set_wallpaper_from_source(&source, scale_mode, false) {
+                    match self.set_wallpaper_from_source(&source, scale_mode, false, false) {
                         Ok(_) => Response::ok(),
                         Err(e) => Response::error(e.to_string()),
                     }
@@ -853,7 +853,8 @@ impl Daemon {
             return Ok(());
         }
 
-        self.set_wallpaper_from_source(&source, mode, shuffle)
+        // Default to per-monitor (span = false)
+        self.set_wallpaper_from_source(&source, mode, shuffle, false)
     }
 
     /// Start an animated image playback (GIF, WebP, APNG, or video)
@@ -1084,12 +1085,13 @@ impl Daemon {
         mode: ScaleMode,
         shuffle: bool,
         _interval_secs: Option<u64>,
+        span: bool,
     ) -> Result<()> {
-        self.set_wallpaper_from_source(source, mode, shuffle)
+        self.set_wallpaper_from_source(source, mode, shuffle, span)
     }
 
     /// Set wallpaper from a source (file, directory, or URL)
-    fn set_wallpaper_from_source(&mut self, source: &str, mode: ScaleMode, shuffle: bool) -> Result<()> {
+    fn set_wallpaper_from_source(&mut self, source: &str, mode: ScaleMode, shuffle: bool, span: bool) -> Result<()> {
         // Expand path
         let expanded = shellexpand::tilde(source);
         let path = std::path::Path::new(expanded.as_ref());
@@ -1118,7 +1120,7 @@ impl Daemon {
             playlist.save()?;
             self.state.playlist = Some(playlist);
 
-            self.set_wallpaper(&first, mode)?;
+            self.set_wallpaper_with_span(&first, mode, span)?;
 
             tracing::info!(
                 "Playlist loaded: {} images{}",
@@ -1128,14 +1130,10 @@ impl Daemon {
         } else if source.starts_with("http://") || source.starts_with("https://") {
             // Remote URL
             let image = self.fetch_image(source)?;
-            let conn = self.conn_mut()?;
-            let (width, height) = conn.screen_dimensions();
-            let scaled = scale_image(&image, width as u32, height as u32, mode);
-            conn.set_wallpaper(&scaled)?;
-            tracing::info!("Wallpaper set: {} (mode: {})", source, mode);
+            self.set_image_with_span(&image, source, mode, span)?;
         } else {
             // Single file
-            self.set_wallpaper(source, mode)?;
+            self.set_wallpaper_with_span(source, mode, span)?;
         }
 
         Ok(())
@@ -1143,14 +1141,43 @@ impl Daemon {
 
     /// Set wallpaper from a local file
     pub fn set_wallpaper(&mut self, source: &str, mode: ScaleMode) -> Result<()> {
+        self.set_wallpaper_with_span(source, mode, false)
+    }
+
+    /// Set wallpaper from a local file with span option
+    pub fn set_wallpaper_with_span(&mut self, source: &str, mode: ScaleMode, span: bool) -> Result<()> {
         let expanded = shellexpand::tilde(source);
         let image = ImageLoader::load_file(expanded.as_ref())?;
-        let conn = self.conn_mut()?;
-        let (width, height) = conn.screen_dimensions();
-        let scaled = scale_image(&image, width as u32, height as u32, mode);
-        conn.set_wallpaper(&scaled)?;
+        self.set_image_with_span(&image, source, mode, span)
+    }
 
-        tracing::info!("Wallpaper set: {} (mode: {})", source, mode);
+    /// Set wallpaper from an image with span option
+    fn set_image_with_span(&mut self, image: &image::RgbaImage, source: &str, mode: ScaleMode, span: bool) -> Result<()> {
+        let conn = self.conn()?;
+        let monitors = Monitor::get_all(conn).unwrap_or_default();
+
+        if !span && monitors.len() > 1 {
+            // Per-monitor mode: scale wallpaper to each monitor individually
+            let compositor = Compositor::new(&monitors);
+            let wallpapers = Compositor::create_wallpapers_uniform(&monitors, image, mode);
+            let composited = compositor.composite(&wallpapers);
+            self.conn_mut()?.set_wallpaper(&composited)?;
+
+            tracing::info!(
+                "Wallpaper set on {} monitors: {} (mode: {})",
+                monitors.len(),
+                source,
+                mode
+            );
+        } else {
+            // Span mode or single monitor: scale to full screen
+            let conn = self.conn_mut()?;
+            let (width, height) = conn.screen_dimensions();
+            let scaled = scale_image(image, width as u32, height as u32, mode);
+            conn.set_wallpaper(&scaled)?;
+
+            tracing::info!("Wallpaper set: {} (mode: {})", source, mode);
+        }
 
         Ok(())
     }
@@ -1262,7 +1289,8 @@ impl Daemon {
 
         if let Some(config) = ws_config {
             let mode = config.mode.unwrap_or(self.state.config.general.mode);
-            self.set_wallpaper_from_source(&config.source, mode, false)?;
+            // Default to per-monitor (span = false)
+            self.set_wallpaper_from_source(&config.source, mode, false, false)?;
         }
 
         Ok(())
