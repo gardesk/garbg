@@ -15,6 +15,37 @@ impl FileProvider {
         Self
     }
 
+    /// Recursively collect supported image files from a directory.
+    fn collect_images(dir: &Path, entries: &mut Vec<WallpaperEntry>) -> Result<()> {
+        let read_dir = std::fs::read_dir(dir)
+            .with_context(|| format!("Failed to read directory: {}", dir.display()))?;
+
+        for entry in read_dir.flatten() {
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                Self::collect_images(&entry_path, entries)?;
+            } else if entry_path.is_file() && ImageLoader::is_supported_format(&entry_path) {
+                let name = entry_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+
+                let size = entry.metadata().ok().map(|m| m.len());
+
+                entries.push(WallpaperEntry {
+                    uri: entry_path.to_string_lossy().to_string(),
+                    name,
+                    media_type: Self::media_type_from_path(&entry_path),
+                    size,
+                    metadata: Default::default(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
     /// Determine media type from file extension
     fn media_type_from_path(path: &Path) -> MediaType {
         let ext = path
@@ -64,32 +95,9 @@ impl SourceProvider for FileProvider {
                 metadata: Default::default(),
             }])
         } else if path.is_dir() {
-            // Directory - list all supported files
+            // Directory - recursively list all supported files
             let mut entries = Vec::new();
-
-            let read_dir = std::fs::read_dir(path)
-                .with_context(|| format!("Failed to read directory: {}", path.display()))?;
-
-            for entry in read_dir.flatten() {
-                let entry_path = entry.path();
-                if entry_path.is_file() && ImageLoader::is_supported_format(&entry_path) {
-                    let name = entry_path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-
-                    let size = entry.metadata().ok().map(|m| m.len());
-
-                    entries.push(WallpaperEntry {
-                        uri: entry_path.to_string_lossy().to_string(),
-                        name,
-                        media_type: Self::media_type_from_path(&entry_path),
-                        size,
-                        metadata: Default::default(),
-                    });
-                }
-            }
+            Self::collect_images(path, &mut entries)?;
 
             // Sort by name
             entries.sort_by(|a, b| a.name.cmp(&b.name));
