@@ -1344,7 +1344,7 @@ impl Daemon {
         self.list_local_directory(&expanded)
     }
 
-    /// List images in a local directory
+    /// List images in a local directory (recursively)
     fn list_local_directory(&self, path: &str) -> Result<Vec<String>> {
         let dir_path = std::path::Path::new(path);
 
@@ -1357,16 +1357,23 @@ impl Daemon {
         }
 
         let mut images = Vec::new();
-        for entry in std::fs::read_dir(dir_path)? {
+        Self::collect_images_recursive(dir_path, &mut images)?;
+        images.sort();
+        Ok(images)
+    }
+
+    /// Recursively collect supported image files from a directory.
+    fn collect_images_recursive(dir: &std::path::Path, images: &mut Vec<String>) -> Result<()> {
+        for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let entry_path = entry.path();
-            if entry_path.is_file() && ImageLoader::is_supported_format(&entry_path) {
+            if entry_path.is_dir() {
+                Self::collect_images_recursive(&entry_path, images)?;
+            } else if entry_path.is_file() && ImageLoader::is_supported_format(&entry_path) {
                 images.push(entry_path.to_string_lossy().to_string());
             }
         }
-
-        images.sort();
-        Ok(images)
+        Ok(())
     }
 
     /// Get connected monitors info via RandR
