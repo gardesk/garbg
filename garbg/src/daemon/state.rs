@@ -224,7 +224,12 @@ impl Daemon {
     }
 
     /// Attempt to establish/re-establish X11 connection
+    ///
+    /// On reconnection, refreshes `DISPLAY` from the systemd user environment
+    /// since the X display number may change across session restarts (e.g. `:0` -> `:1`).
     fn try_connect_x11(&mut self) -> bool {
+        Self::refresh_display_env();
+
         match Connection::new() {
             Ok(conn) => {
                 let (width, height) = conn.screen_dimensions();
@@ -235,6 +240,42 @@ impl Daemon {
             Err(e) => {
                 tracing::debug!("X11 connection failed: {}", e);
                 false
+            }
+        }
+    }
+
+    /// Refresh DISPLAY (and XAUTHORITY) from the systemd user manager environment.
+    ///
+    /// When the X session restarts, the display number can change (e.g. `:0` -> `:1`).
+    /// systemd's user manager gets updated via `systemctl --user import-environment`,
+    /// but a long-running daemon keeps the stale value in its own process environment.
+    fn refresh_display_env() {
+        let output = match std::process::Command::new("systemctl")
+            .args(["--user", "show-environment"])
+            .output()
+        {
+            Ok(o) if o.status.success() => o,
+            _ => return,
+        };
+
+        let env_str = match std::str::from_utf8(&output.stdout) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        for line in env_str.lines() {
+            if let Some(val) = line.strip_prefix("DISPLAY=") {
+                let current = std::env::var("DISPLAY").unwrap_or_default();
+                if current != val {
+                    tracing::info!("DISPLAY changed: {} -> {}", current, val);
+                    std::env::set_var("DISPLAY", val);
+                }
+            } else if let Some(val) = line.strip_prefix("XAUTHORITY=") {
+                let current = std::env::var("XAUTHORITY").unwrap_or_default();
+                if current != val {
+                    tracing::info!("XAUTHORITY changed: {} -> {}", current, val);
+                    std::env::set_var("XAUTHORITY", val);
+                }
             }
         }
     }
