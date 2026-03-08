@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::config::ScaleMode;
-use crate::media::{scale_image, AnimatedGif};
+use crate::media::{scale_image_fast, AnimatedGif};
 use crate::x11::{AnimationRenderer, Connection};
 
 /// Configuration for the animation loop
@@ -63,7 +63,7 @@ impl AnimationLoop {
             .frames()
             .iter()
             .map(|frame| {
-                scale_image(
+                scale_image_fast(
                     &frame.image,
                     screen_width as u32,
                     screen_height as u32,
