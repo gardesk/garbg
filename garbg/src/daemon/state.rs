@@ -625,18 +625,18 @@ impl Daemon {
                 // Stop any existing animation first
                 self.animation = None;
 
-                // Check if we should animate (GIF, WebP, or APNG with animate flag)
+                // Detect animated formats from URL/path
                 let source_lower = source.to_lowercase();
-                let is_animatable = source_lower.ends_with(".gif")
+
+                // Formats that are almost always animated — auto-detect
+                let auto_animate = source_lower.ends_with(".gif")
                     || source_lower.contains(".gif?")
                     || source_lower.contains("/gif/")
                     || source_lower.ends_with(".webp")
                     || source_lower.contains(".webp?")
                     || source_lower.contains("/webp/")
                     || source_lower.ends_with(".apng")
-                    || source_lower.ends_with(".png")  // PNG might be APNG
                     || source_lower.contains(".apng?")
-                    // Video formats
                     || source_lower.ends_with(".mp4")
                     || source_lower.ends_with(".webm")
                     || source_lower.ends_with(".mkv")
@@ -644,16 +644,11 @@ impl Daemon {
                     || source_lower.ends_with(".mov")
                     || source_lower.ends_with(".m4v");
 
-                // Videos should always be animated (no sense displaying a single frame)
-                let is_video = source_lower.ends_with(".mp4")
-                    || source_lower.ends_with(".webm")
-                    || source_lower.ends_with(".mkv")
-                    || source_lower.ends_with(".avi")
-                    || source_lower.ends_with(".mov")
-                    || source_lower.ends_with(".m4v");
+                // PNG needs explicit --animate (most PNGs aren't APNG)
+                let png_animate = animate && (source_lower.ends_with(".png"));
 
-                // Auto-animate videos, or animate if flag is set for other formats
-                let should_animate = is_video || (animate && is_animatable);
+                // Auto-animate known formats; --animate forces attempt on .png
+                let should_animate = auto_animate || png_animate;
 
                 if should_animate {
                     // Try to start animation
