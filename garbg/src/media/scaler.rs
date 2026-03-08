@@ -4,24 +4,44 @@ use image::{imageops::FilterType, RgbaImage};
 
 use crate::config::ScaleMode;
 
-/// Scale an image according to the specified mode
+/// Scale an image according to the specified mode (high quality, Lanczos3)
 pub fn scale_image(
     image: &RgbaImage,
     target_width: u32,
     target_height: u32,
     mode: ScaleMode,
 ) -> RgbaImage {
+    scale_image_inner(image, target_width, target_height, mode, FilterType::Lanczos3)
+}
+
+/// Scale an image using a fast filter (Triangle) — suited for animation frames
+pub fn scale_image_fast(
+    image: &RgbaImage,
+    target_width: u32,
+    target_height: u32,
+    mode: ScaleMode,
+) -> RgbaImage {
+    scale_image_inner(image, target_width, target_height, mode, FilterType::Triangle)
+}
+
+fn scale_image_inner(
+    image: &RgbaImage,
+    target_width: u32,
+    target_height: u32,
+    mode: ScaleMode,
+    filter: FilterType,
+) -> RgbaImage {
     match mode {
-        ScaleMode::Fill => scale_fill(image, target_width, target_height),
-        ScaleMode::Fit => scale_fit(image, target_width, target_height),
-        ScaleMode::Stretch => scale_stretch(image, target_width, target_height),
+        ScaleMode::Fill => scale_fill(image, target_width, target_height, filter),
+        ScaleMode::Fit => scale_fit(image, target_width, target_height, filter),
+        ScaleMode::Stretch => scale_stretch(image, target_width, target_height, filter),
         ScaleMode::Center => scale_center(image, target_width, target_height),
         ScaleMode::Tile => scale_tile(image, target_width, target_height),
     }
 }
 
 /// Fill: Scale to cover entire area, crop excess
-fn scale_fill(image: &RgbaImage, target_width: u32, target_height: u32) -> RgbaImage {
+fn scale_fill(image: &RgbaImage, target_width: u32, target_height: u32, filter: FilterType) -> RgbaImage {
     let (src_width, src_height) = image.dimensions();
 
     // Calculate scale factor to cover the entire target
@@ -33,7 +53,7 @@ fn scale_fill(image: &RgbaImage, target_width: u32, target_height: u32) -> RgbaI
     let scaled_height = (src_height as f64 * scale).round() as u32;
 
     // Scale image
-    let scaled = image::imageops::resize(image, scaled_width, scaled_height, FilterType::Lanczos3);
+    let scaled = image::imageops::resize(image, scaled_width, scaled_height, filter);
 
     // Crop to target size (center crop)
     let crop_x = (scaled_width.saturating_sub(target_width)) / 2;
@@ -43,7 +63,7 @@ fn scale_fill(image: &RgbaImage, target_width: u32, target_height: u32) -> RgbaI
 }
 
 /// Fit: Scale to fit within area, letterbox if needed
-fn scale_fit(image: &RgbaImage, target_width: u32, target_height: u32) -> RgbaImage {
+fn scale_fit(image: &RgbaImage, target_width: u32, target_height: u32, filter: FilterType) -> RgbaImage {
     let (src_width, src_height) = image.dimensions();
 
     // Calculate scale factor to fit within target
@@ -55,7 +75,7 @@ fn scale_fit(image: &RgbaImage, target_width: u32, target_height: u32) -> RgbaIm
     let scaled_height = (src_height as f64 * scale).round() as u32;
 
     // Scale image
-    let scaled = image::imageops::resize(image, scaled_width, scaled_height, FilterType::Lanczos3);
+    let scaled = image::imageops::resize(image, scaled_width, scaled_height, filter);
 
     // Create output with black background
     let mut output = RgbaImage::from_pixel(target_width, target_height, image::Rgba([0, 0, 0, 255]));
@@ -70,8 +90,8 @@ fn scale_fit(image: &RgbaImage, target_width: u32, target_height: u32) -> RgbaIm
 }
 
 /// Stretch: Scale to exact target size, ignoring aspect ratio
-fn scale_stretch(image: &RgbaImage, target_width: u32, target_height: u32) -> RgbaImage {
-    image::imageops::resize(image, target_width, target_height, FilterType::Lanczos3)
+fn scale_stretch(image: &RgbaImage, target_width: u32, target_height: u32, filter: FilterType) -> RgbaImage {
+    image::imageops::resize(image, target_width, target_height, filter)
 }
 
 /// Center: Display at original size, centered
@@ -136,21 +156,21 @@ mod tests {
     #[test]
     fn test_scale_stretch() {
         let img = test_image(100, 100);
-        let scaled = scale_stretch(&img, 200, 150);
+        let scaled = scale_stretch(&img, 200, 150, FilterType::Lanczos3);
         assert_eq!(scaled.dimensions(), (200, 150));
     }
 
     #[test]
     fn test_scale_fill() {
         let img = test_image(100, 100);
-        let scaled = scale_fill(&img, 200, 150);
+        let scaled = scale_fill(&img, 200, 150, FilterType::Lanczos3);
         assert_eq!(scaled.dimensions(), (200, 150));
     }
 
     #[test]
     fn test_scale_fit() {
         let img = test_image(100, 100);
-        let scaled = scale_fit(&img, 200, 150);
+        let scaled = scale_fit(&img, 200, 150, FilterType::Lanczos3);
         assert_eq!(scaled.dimensions(), (200, 150));
     }
 

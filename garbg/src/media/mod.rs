@@ -13,7 +13,7 @@ mod frame_buffer;
 mod video;
 
 pub use loader::ImageLoader;
-pub use scaler::scale_image;
+pub use scaler::{scale_image, scale_image_fast};
 pub use gif::{AnimatedGif, AnimationFrame, is_animated_gif};
 pub use webp::{AnimatedWebP, is_animated_webp, is_animated_webp_bytes};
 pub use apng::{AnimatedPng, is_animated_png, is_animated_png_bytes};
