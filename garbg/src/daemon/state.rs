@@ -10,7 +10,7 @@ use crate::cache::DiskCache;
 use crate::config::{Config, ScaleMode};
 use crate::ipc::{Command, GarEvent, GarIpcClient, IpcServer, Response};
 use crate::ipc::server::IpcClient;
-use crate::media::{scale_image, AnimatedGif, AnimatedPng, AnimatedWebP, AnimationFrame, ImageLoader};
+use crate::media::{scale_image, scale_image_fast, AnimatedGif, AnimatedPng, AnimatedWebP, AnimationFrame, ImageLoader};
 #[cfg(feature = "video")]
 use crate::media::{VideoDecoder, is_video_file};
 use crate::state::{detect_source_type, PlaylistState};
@@ -93,7 +93,7 @@ pub struct ActiveAnimation {
 }
 
 impl ActiveAnimation {
-    /// Create from animation frames
+    /// Create from animation frames (scales in parallel with fast filter)
     fn from_frames(
         frames: &[AnimationFrame],
         renderer: AnimationRenderer,
@@ -103,10 +103,18 @@ impl ActiveAnimation {
         screen_width: u32,
         screen_height: u32,
     ) -> Self {
-        let scaled_frames: Vec<image::RgbaImage> = frames
-            .iter()
-            .map(|frame| scale_image(&frame.image, screen_width, screen_height, scale_mode))
-            .collect();
+        // Scale frames in parallel using thread::scope for multi-core speedup
+        let scaled_frames: Vec<image::RgbaImage> = std::thread::scope(|s| {
+            let handles: Vec<_> = frames
+                .iter()
+                .map(|frame| {
+                    s.spawn(move || {
+                        scale_image_fast(&frame.image, screen_width, screen_height, scale_mode)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
 
         let frame_delays: Vec<Duration> = frames
             .iter()
