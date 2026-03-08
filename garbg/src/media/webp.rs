@@ -159,7 +159,7 @@ fn frame_delay_to_duration(frame: &Frame) -> Duration {
     if denominator == 0 {
         Duration::ZERO
     } else {
-        Duration::from_millis((numerator as u64 * 1000) / denominator as u64)
+        Duration::from_micros((numerator as u64 * 1000) / denominator as u64)
     }
 }
 
