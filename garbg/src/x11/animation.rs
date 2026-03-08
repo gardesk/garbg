@@ -76,21 +76,24 @@ impl DoubleBuffer {
 pub struct AnimationRenderer {
     /// Double buffer for smooth rendering
     buffer: DoubleBuffer,
+    /// Reusable BGRA conversion buffer (avoids per-frame allocation)
+    bgra_buf: Vec<u8>,
 }
 
 impl AnimationRenderer {
     /// Create a new animation renderer
     pub fn new(conn: &Connection) -> Result<Self> {
         let buffer = DoubleBuffer::new(conn)?;
-        Ok(Self { buffer })
+        Ok(Self { buffer, bgra_buf: Vec::new() })
     }
 
     /// Render a frame to the back buffer
     pub fn render_frame(&mut self, conn: &mut Connection, frame: &image::RgbaImage) -> Result<()> {
         let (width, height) = self.buffer.dimensions();
 
-        // Convert RGBA to BGRA (X11 native format)
-        let bgra_data = rgba_to_bgra(frame);
+        // Convert RGBA to BGRA in-place using reusable buffer
+        rgba_to_bgra_into(frame, &mut self.bgra_buf);
+        let bgra_data = &self.bgra_buf;
 
         let gc = conn.gc();
         let x11_conn = conn.conn();
@@ -188,14 +191,16 @@ impl AnimationRenderer {
     }
 }
 
-/// Convert RGBA to BGRA (X11 native format for 32-bit visuals)
-fn rgba_to_bgra(image: &image::RgbaImage) -> Vec<u8> {
-    let mut bgra = Vec::with_capacity(image.len());
-    for pixel in image.pixels() {
-        bgra.push(pixel[2]); // B
-        bgra.push(pixel[1]); // G
-        bgra.push(pixel[0]); // R
-        bgra.push(pixel[3]); // A
+/// Convert RGBA to BGRA into a reusable buffer (X11 native format for 32-bit visuals)
+fn rgba_to_bgra_into(image: &image::RgbaImage, buf: &mut Vec<u8>) {
+    let raw = image.as_raw();
+    buf.clear();
+    buf.reserve(raw.len());
+    // Process 4 bytes at a time (one pixel)
+    for chunk in raw.chunks_exact(4) {
+        buf.push(chunk[2]); // B
+        buf.push(chunk[1]); // G
+        buf.push(chunk[0]); // R
+        buf.push(chunk[3]); // A
     }
-    bgra
 }
