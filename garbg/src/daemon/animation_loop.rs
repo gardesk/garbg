@@ -11,6 +11,9 @@ use crate::config::ScaleMode;
 use crate::media::{scale_image_fast, AnimatedGif};
 use crate::x11::{AnimationRenderer, Connection};
 
+/// Default memory budget for pre-scaled animation frames (256 MB)
+const DEFAULT_MEMORY_BUDGET: u64 = 256 * 1024 * 1024;
+
 /// Configuration for the animation loop
 #[derive(Debug, Clone)]
 pub struct AnimationConfig {
@@ -38,8 +41,13 @@ pub struct AnimationLoop {
     gif: AnimatedGif,
     /// X11 animation renderer
     renderer: AnimationRenderer,
-    /// Pre-scaled frames (cached)
+    /// Pre-scaled frames (empty if streaming mode)
     scaled_frames: Vec<image::RgbaImage>,
+    /// Whether to scale frames on-the-fly instead of pre-scaling
+    streaming: bool,
+    /// Screen dimensions (used for on-the-fly scaling)
+    screen_width: u32,
+    screen_height: u32,
     /// Configuration
     config: AnimationConfig,
     /// Whether the animation is paused
@@ -57,25 +65,42 @@ impl AnimationLoop {
     ) -> Result<Self> {
         let renderer = AnimationRenderer::new(conn)?;
         let (screen_width, screen_height) = renderer.dimensions();
+        let sw = screen_width as u32;
+        let sh = screen_height as u32;
 
-        // Pre-scale all frames
-        let scaled_frames: Vec<image::RgbaImage> = gif
-            .frames()
-            .iter()
-            .map(|frame| {
-                scale_image_fast(
-                    &frame.image,
-                    screen_width as u32,
-                    screen_height as u32,
-                    config.scale_mode,
-                )
-            })
-            .collect();
+        let per_frame_bytes = sw as u64 * sh as u64 * 4;
+        let total_bytes = per_frame_bytes * gif.frame_count() as u64;
+
+        let (scaled_frames, streaming) = if total_bytes <= DEFAULT_MEMORY_BUDGET {
+            tracing::info!(
+                "Animation fits in memory budget ({:.1} MB), pre-scaling all {} frames",
+                total_bytes as f64 / (1024.0 * 1024.0),
+                gif.frame_count(),
+            );
+            let frames: Vec<image::RgbaImage> = gif
+                .frames()
+                .iter()
+                .map(|frame| {
+                    scale_image_fast(&frame.image, sw, sh, config.scale_mode)
+                })
+                .collect();
+            (frames, false)
+        } else {
+            tracing::info!(
+                "Animation exceeds memory budget ({:.1} MB > {:.1} MB), scaling frames on-the-fly",
+                total_bytes as f64 / (1024.0 * 1024.0),
+                DEFAULT_MEMORY_BUDGET as f64 / (1024.0 * 1024.0),
+            );
+            (Vec::new(), true)
+        };
 
         Ok(Self {
             gif,
             renderer,
             scaled_frames,
+            streaming,
+            screen_width: sw,
+            screen_height: sh,
             config,
             paused: Arc::new(AtomicBool::new(false)),
             stop: Arc::new(AtomicBool::new(false)),
@@ -165,8 +190,18 @@ impl AnimationLoop {
             }
 
             // Render current frame
-            let scaled_frame = &self.scaled_frames[frame_index];
-            self.renderer.render_and_present(conn, scaled_frame)?;
+            if self.streaming {
+                let scaled = scale_image_fast(
+                    &self.gif.frames()[frame_index].image,
+                    self.screen_width,
+                    self.screen_height,
+                    self.config.scale_mode,
+                );
+                self.renderer.render_and_present(conn, &scaled)?;
+            } else {
+                let scaled_frame = &self.scaled_frames[frame_index];
+                self.renderer.render_and_present(conn, scaled_frame)?;
+            }
 
             // Get delay for current frame
             let frame_delay = self.gif.frames()[frame_index].delay;
@@ -199,10 +234,20 @@ impl AnimationLoop {
         }
 
         let frame_index = self.gif.current_index();
-        let scaled_frame = &self.scaled_frames[frame_index];
 
         // Render current frame
-        self.renderer.render_and_present(conn, scaled_frame)?;
+        if self.streaming {
+            let scaled = scale_image_fast(
+                &self.gif.frames()[frame_index].image,
+                self.screen_width,
+                self.screen_height,
+                self.config.scale_mode,
+            );
+            self.renderer.render_and_present(conn, &scaled)?;
+        } else {
+            let scaled_frame = &self.scaled_frames[frame_index];
+            self.renderer.render_and_present(conn, scaled_frame)?;
+        }
 
         // Get delay for current frame
         let delay = self.gif.current_frame().delay;
