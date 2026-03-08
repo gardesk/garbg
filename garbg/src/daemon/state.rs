@@ -1,7 +1,10 @@
 //! Daemon state management
 
 use anyhow::{Context, Result};
+use crossbeam_channel::Receiver;
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio::net::UnixStream;
 use tokio::signal::unix::{signal, SignalKind};
@@ -72,16 +75,36 @@ impl DaemonState {
     }
 }
 
+/// Frame source strategy for animation playback
+enum FrameSource {
+    /// All frames pre-scaled in memory (small animations within memory budget)
+    Preloaded {
+        scaled_frames: Vec<image::RgbaImage>,
+        frame_delays: Vec<Duration>,
+        current_frame: usize,
+    },
+    /// Frames scaled on demand by a background producer thread (large animations)
+    Streaming {
+        /// Receiver for scaled frames from the producer
+        rx: Receiver<(image::RgbaImage, Duration)>,
+        /// Handle to the producer thread (dropped = detached, thread exits on send error)
+        _producer: JoinHandle<()>,
+        /// The last successfully received frame (re-displayed if producer is behind)
+        last_frame: Option<image::RgbaImage>,
+        /// Delay of the last frame
+        last_delay: Duration,
+        /// Total frame count (for logging)
+        #[allow(dead_code)]
+        frame_count: usize,
+    },
+}
+
 /// Active animation state (works with GIF, WebP, or other animated formats)
 pub struct ActiveAnimation {
-    /// Pre-scaled frames for quick rendering
-    scaled_frames: Vec<image::RgbaImage>,
-    /// Frame delays (parallel to scaled_frames)
-    frame_delays: Vec<Duration>,
+    /// Frame source (preloaded or streaming)
+    frame_source: FrameSource,
     /// Animation renderer (double-buffered)
     renderer: AnimationRenderer,
-    /// Current frame index
-    current_frame: usize,
     /// Max FPS
     max_fps: u32,
     /// Scale mode (for status)
@@ -93,7 +116,7 @@ pub struct ActiveAnimation {
 }
 
 impl ActiveAnimation {
-    /// Create from animation frames (scales in parallel with fast filter)
+    /// Create from animation frames, choosing pre-load or streaming based on memory budget
     fn from_frames(
         frames: &[AnimationFrame],
         renderer: AnimationRenderer,
@@ -102,14 +125,52 @@ impl ActiveAnimation {
         source: String,
         screen_width: u32,
         screen_height: u32,
+        memory_budget: u64,
     ) -> Self {
-        // Scale frames in parallel, limited to available CPU cores
+        let per_frame_bytes = screen_width as u64 * screen_height as u64 * 4;
+        let total_bytes = per_frame_bytes * frames.len() as u64;
+
+        let frame_source = if total_bytes <= memory_budget {
+            tracing::info!(
+                "Animation fits in memory budget ({:.1} MB <= {:.1} MB), pre-scaling all {} frames",
+                total_bytes as f64 / (1024.0 * 1024.0),
+                memory_budget as f64 / (1024.0 * 1024.0),
+                frames.len(),
+            );
+            Self::preload_frames(frames, screen_width, screen_height, scale_mode)
+        } else {
+            let max_buffered = (memory_budget / 2 / per_frame_bytes).max(2).min(8) as usize;
+            tracing::info!(
+                "Animation exceeds memory budget ({:.1} MB > {:.1} MB), streaming with {} frame buffer",
+                total_bytes as f64 / (1024.0 * 1024.0),
+                memory_budget as f64 / (1024.0 * 1024.0),
+                max_buffered,
+            );
+            Self::stream_frames(frames, screen_width, screen_height, scale_mode, max_buffered)
+        };
+
+        Self {
+            frame_source,
+            renderer,
+            max_fps,
+            scale_mode,
+            source,
+        }
+    }
+
+    /// Pre-scale all frames in parallel (existing behavior, for small animations)
+    fn preload_frames(
+        frames: &[AnimationFrame],
+        screen_width: u32,
+        screen_height: u32,
+        scale_mode: ScaleMode,
+    ) -> FrameSource {
         let num_cpus = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
+
         let scaled_frames: Vec<image::RgbaImage> = std::thread::scope(|s| {
             let mut results = Vec::with_capacity(frames.len());
-            // Process in batches of num_cpus to avoid spawning too many threads
             for chunk in frames.chunks(num_cpus) {
                 let handles: Vec<_> = chunk
                     .iter()
@@ -124,25 +185,68 @@ impl ActiveAnimation {
             results
         });
 
-        let frame_delays: Vec<Duration> = frames
-            .iter()
-            .map(|frame| frame.delay)
-            .collect();
+        let frame_delays: Vec<Duration> = frames.iter().map(|f| f.delay).collect();
 
-        Self {
+        FrameSource::Preloaded {
             scaled_frames,
             frame_delays,
-            renderer,
             current_frame: 0,
-            max_fps,
-            scale_mode,
-            source,
+        }
+    }
+
+    /// Set up streaming producer thread for large animations
+    fn stream_frames(
+        frames: &[AnimationFrame],
+        screen_width: u32,
+        screen_height: u32,
+        scale_mode: ScaleMode,
+        buffer_capacity: usize,
+    ) -> FrameSource {
+        let (tx, rx) = crossbeam_channel::bounded::<(image::RgbaImage, Duration)>(buffer_capacity);
+        let source_frames: Arc<Vec<AnimationFrame>> = Arc::new(frames.to_vec());
+        let frame_count = frames.len();
+
+        let producer = std::thread::Builder::new()
+            .name("garbg-frame-scaler".into())
+            .spawn(move || {
+                let mut index = 0usize;
+                loop {
+                    let frame = &source_frames[index % frame_count];
+                    let scaled = scale_image_fast(
+                        &frame.image,
+                        screen_width,
+                        screen_height,
+                        scale_mode,
+                    );
+                    if tx.send((scaled, frame.delay)).is_err() {
+                        tracing::debug!("Frame producer exiting: receiver dropped");
+                        break;
+                    }
+                    index += 1;
+                }
+            })
+            .expect("failed to spawn frame scaler thread");
+
+        // Block on first frame so animation starts with content
+        let (first_frame, first_delay) = rx.recv().expect("producer died before first frame");
+
+        FrameSource::Streaming {
+            rx,
+            _producer: producer,
+            last_frame: Some(first_frame),
+            last_delay: first_delay,
+            frame_count,
         }
     }
 
     /// Get the delay for the current frame
     fn current_delay(&self) -> Duration {
-        let frame_delay = self.frame_delays[self.current_frame];
+        let frame_delay = match &self.frame_source {
+            FrameSource::Preloaded { frame_delays, current_frame, .. } => {
+                frame_delays[*current_frame]
+            }
+            FrameSource::Streaming { last_delay, .. } => *last_delay,
+        };
         let min_delay = if self.max_fps > 0 {
             Duration::from_secs_f64(1.0 / self.max_fps as f64)
         } else {
@@ -153,19 +257,41 @@ impl ActiveAnimation {
 
     /// Advance to next frame, returning true if looped
     fn advance(&mut self) -> bool {
-        self.current_frame += 1;
-        if self.current_frame >= self.scaled_frames.len() {
-            self.current_frame = 0;
-            true
-        } else {
-            false
+        match &mut self.frame_source {
+            FrameSource::Preloaded { scaled_frames, current_frame, .. } => {
+                *current_frame += 1;
+                if *current_frame >= scaled_frames.len() {
+                    *current_frame = 0;
+                    true
+                } else {
+                    false
+                }
+            }
+            FrameSource::Streaming { rx, last_frame, last_delay, .. } => {
+                match rx.try_recv() {
+                    Ok((frame, delay)) => {
+                        *last_frame = Some(frame);
+                        *last_delay = delay;
+                    }
+                    Err(crossbeam_channel::TryRecvError::Empty) => {
+                        tracing::trace!("Frame producer behind, re-displaying last frame");
+                    }
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        tracing::warn!("Frame producer disconnected");
+                    }
+                }
+                false
+            }
         }
     }
 
     /// Get frame count
     #[allow(dead_code)]
     fn frame_count(&self) -> usize {
-        self.scaled_frames.len()
+        match &self.frame_source {
+            FrameSource::Preloaded { scaled_frames, .. } => scaled_frames.len(),
+            FrameSource::Streaming { frame_count, .. } => *frame_count,
+        }
     }
 }
 
@@ -609,9 +735,17 @@ impl Daemon {
         let anim = self.animation.as_mut()
             .ok_or_else(|| anyhow::anyhow!("No active animation"))?;
 
-        // Render current frame
-        let frame = &anim.scaled_frames[anim.current_frame];
-        anim.renderer.render_and_present(conn, frame)?;
+        // Render current frame (inline match for split borrowing of frame_source vs renderer)
+        match &anim.frame_source {
+            FrameSource::Preloaded { scaled_frames, current_frame, .. } => {
+                anim.renderer.render_and_present(conn, &scaled_frames[*current_frame])?;
+            }
+            FrameSource::Streaming { last_frame, .. } => {
+                if let Some(frame) = last_frame {
+                    anim.renderer.render_and_present(conn, frame)?;
+                }
+            }
+        }
 
         // Advance to next frame
         anim.advance();
@@ -995,13 +1129,19 @@ impl Daemon {
         let renderer = AnimationRenderer::new(conn)?;
         let (width, height) = conn.screen_dimensions();
 
+        let per_frame_mb = (width as f64 * height as f64 * 4.0) / (1024.0 * 1024.0);
         tracing::info!(
-            "Animation loaded: {} frames, {:.1} FPS ({})",
+            "Animation loaded: {} frames, {:.1} FPS ({}), screen {}x{}, {:.1} MB/frame, {:.1} MB total",
             frame_count,
             avg_fps,
-            format_name
+            format_name,
+            width,
+            height,
+            per_frame_mb,
+            per_frame_mb * frame_count as f64,
         );
 
+        let memory_budget = self.state.config.animation.memory_budget_mb * 1024 * 1024;
         self.animation = Some(ActiveAnimation::from_frames(
             &frames,
             renderer,
@@ -1010,6 +1150,7 @@ impl Daemon {
             source.to_string(),
             width as u32,
             height as u32,
+            memory_budget,
         ));
 
         Ok(())
@@ -1067,12 +1208,18 @@ impl Daemon {
         let renderer = AnimationRenderer::new(conn)?;
         let (width, height) = conn.screen_dimensions();
 
+        let per_frame_mb = (width as f64 * height as f64 * 4.0) / (1024.0 * 1024.0);
         tracing::info!(
-            "Video loaded: {} frames, {:.1} FPS",
+            "Video loaded: {} frames, {:.1} FPS, screen {}x{}, {:.1} MB/frame, {:.1} MB total",
             frame_count,
-            avg_fps
+            avg_fps,
+            width,
+            height,
+            per_frame_mb,
+            per_frame_mb * frame_count as f64,
         );
 
+        let memory_budget = self.state.config.animation.memory_budget_mb * 1024 * 1024;
         self.animation = Some(ActiveAnimation::from_frames(
             &frames,
             renderer,
@@ -1081,6 +1228,7 @@ impl Daemon {
             source.to_string(),
             width as u32,
             height as u32,
+            memory_budget,
         ));
 
         Ok(())
