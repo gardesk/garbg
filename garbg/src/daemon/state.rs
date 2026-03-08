@@ -103,17 +103,25 @@ impl ActiveAnimation {
         screen_width: u32,
         screen_height: u32,
     ) -> Self {
-        // Scale frames in parallel using thread::scope for multi-core speedup
+        // Scale frames in parallel, limited to available CPU cores
+        let num_cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
         let scaled_frames: Vec<image::RgbaImage> = std::thread::scope(|s| {
-            let handles: Vec<_> = frames
-                .iter()
-                .map(|frame| {
-                    s.spawn(move || {
-                        scale_image_fast(&frame.image, screen_width, screen_height, scale_mode)
+            let mut results = Vec::with_capacity(frames.len());
+            // Process in batches of num_cpus to avoid spawning too many threads
+            for chunk in frames.chunks(num_cpus) {
+                let handles: Vec<_> = chunk
+                    .iter()
+                    .map(|frame| {
+                        s.spawn(move || {
+                            scale_image_fast(&frame.image, screen_width, screen_height, scale_mode)
+                        })
                     })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
+                    .collect();
+                results.extend(handles.into_iter().map(|h| h.join().unwrap()));
+            }
+            results
         });
 
         let frame_delays: Vec<Duration> = frames
