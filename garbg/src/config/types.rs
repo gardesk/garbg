@@ -70,6 +70,10 @@ pub struct AnimationConfig {
 
     /// Pause animations when idle/locked
     pub pause_on_idle: bool,
+
+    /// Maximum memory budget for pre-scaled animation frames (in MB).
+    /// Animations exceeding this budget will stream-scale frames on the fly.
+    pub memory_budget_mb: u64,
 }
 
 impl Default for AnimationConfig {
@@ -78,6 +82,7 @@ impl Default for AnimationConfig {
             enabled: true,
             max_fps: 60,
             pause_on_idle: true,
+            memory_budget_mb: 256,
         }
     }
 }
